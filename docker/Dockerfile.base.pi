@@ -1,0 +1,22 @@
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Pi still needs Chromium because launch-bot.ts runs the actual browser game
+# client. Xvfb keeps the client in a rendered display, but Pi local runs do not
+# need the optional FFmpeg/PulseAudio recording stack.
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    chromium \
+    default-jre-headless \
+    unzip \
+    ca-certificates \
+    procps \
+    xvfb \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://bun.sh/install | bash
+ENV PATH="/root/.bun/bin:$PATH"
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium

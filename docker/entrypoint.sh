@@ -2,6 +2,10 @@
 set -e
 
 # ── Xvfb virtual display ─────────────────────────────────────────
+# Pi's minimal image keeps Xvfb because the browser game client still uses a
+# rendered display. It disables only recording/audio, not the game client.
+PI_MINIMAL="${PI_MINIMAL:-0}"
+XVFB_PID=""
 echo "[entrypoint] Starting Xvfb virtual display..."
 Xvfb :99 -screen 0 800x600x24 -ac &
 XVFB_PID=$!
@@ -11,22 +15,26 @@ sleep 1
 # ── PulseAudio (lets ffmpeg capture the game client's music/sfx) ─
 # Explicit socket + PULSE_SERVER so chromium (started later, inherits
 # this env) and ffmpeg talk to the same daemon regardless of XDG dirs.
-echo "[entrypoint] Starting PulseAudio..."
-export PULSE_SERVER=unix:/tmp/pulse.sock
-pulseaudio -D --exit-idle-time=-1 \
-    --load="module-native-protocol-unix auth-anonymous=1 socket=/tmp/pulse.sock" \
-    > /dev/null 2>&1 || true
 AUDIO_OK=false
-for i in $(seq 1 10); do
-    if pactl info > /dev/null 2>&1; then AUDIO_OK=true; break; fi
-    sleep 1
-done
-if $AUDIO_OK; then
-    pactl load-module module-null-sink sink_name=game > /dev/null
-    pactl set-default-sink game
-    echo "[entrypoint] PulseAudio ready (null sink 'game')"
+if [ "$PI_MINIMAL" = "1" ]; then
+    echo "[entrypoint] Pi minimal image: PulseAudio disabled"
 else
-    echo "[entrypoint] WARNING: PulseAudio failed to start — recording will have no audio"
+    echo "[entrypoint] Starting PulseAudio..."
+    export PULSE_SERVER=unix:/tmp/pulse.sock
+    pulseaudio -D --exit-idle-time=-1 \
+        --load="module-native-protocol-unix auth-anonymous=1 socket=/tmp/pulse.sock" \
+        > /dev/null 2>&1 || true
+    for i in $(seq 1 10); do
+        if pactl info > /dev/null 2>&1; then AUDIO_OK=true; break; fi
+        sleep 1
+    done
+    if $AUDIO_OK; then
+        pactl load-module module-null-sink sink_name=game > /dev/null
+        pactl set-default-sink game
+        echo "[entrypoint] PulseAudio ready (null sink 'game')"
+    else
+        echo "[entrypoint] WARNING: PulseAudio failed to start — recording will have no audio"
+    fi
 fi
 
 # ── Helper: start engine and wait for readiness ──────────────────
@@ -108,6 +116,9 @@ RECORD_VIDEO="${RECORD_VIDEO:-1}"
 FFMPEG_PID=""
 mkdir -p /logs/verifier
 if [ "$RECORD_VIDEO" = "1" ]; then
+    if ! command -v ffmpeg > /dev/null 2>&1; then
+        echo "[entrypoint] WARNING: RECORD_VIDEO=1 but ffmpeg is not installed; skipping recording"
+    else
     # Capture game audio off the null sink's monitor when pulse is up;
     # fall back to video-only so a dead daemon never kills the recording.
     AUDIO_IN=()
@@ -130,6 +141,7 @@ if [ "$RECORD_VIDEO" = "1" ]; then
         > /logs/verifier/ffmpeg.log 2>&1 &
     FFMPEG_PID=$!
     sleep 2
+    fi
 fi
 
 echo "[entrypoint] All services running (engine=$ENGINE_PID, gateway=$GATEWAY_PID, bot=$BOT_PID)"

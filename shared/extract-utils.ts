@@ -146,6 +146,14 @@ export function parseRewardFromStdout(content: string): any | null {
 
 /** Find tracking data within a single trial directory */
 export function findTrackingInTrial(trialDir: string): { samples: Sample[]; botName?: string; startTime?: string } | null {
+  const richResultPath = join(trialDir, 'verifier', 'runebench-result.json');
+  if (existsSync(richResultPath)) {
+    try {
+      const result = JSON.parse(readFileSync(richResultPath, 'utf-8'));
+      if (result.tracking?.samples?.length > 0) return result.tracking;
+    } catch {}
+  }
+
   const rewardPath = join(trialDir, 'verifier', 'reward.json');
   if (existsSync(rewardPath)) {
     try {
@@ -176,6 +184,14 @@ export function findTrackingInTrial(trialDir: string): { samples: Sample[]; botN
 
 /** Find reward data within a single trial directory */
 export function findRewardInTrial(trialDir: string): { xp: number; level: number; peakXpRate?: number } | null {
+  const richResultPath = join(trialDir, 'verifier', 'runebench-result.json');
+  if (existsSync(richResultPath)) {
+    try {
+      const reward = JSON.parse(readFileSync(richResultPath, 'utf-8'));
+      if (reward.xp !== undefined) return { xp: reward.xp, level: reward.level ?? 1, peakXpRate: reward.peakXpRate };
+    } catch {}
+  }
+
   const rewardPath = join(trialDir, 'verifier', 'reward.json');
   if (existsSync(rewardPath)) {
     try {

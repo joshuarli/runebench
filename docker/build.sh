@@ -16,6 +16,8 @@ if [ "$1" = "--base" ]; then
 fi
 
 PLATFORM="${PLATFORM:-linux/amd64}"
+BASE_DOCKERFILE="${BASE_DOCKERFILE:-Dockerfile.base}"
+APP_DOCKERFILE="${DOCKERFILE:-Dockerfile}"
 cd "$(dirname "$0")"
 
 if [ "$BUILD_BASE" = true ]; then
@@ -25,17 +27,18 @@ if [ "$BUILD_BASE" = true ]; then
     echo "Building BASE image: ${FULL_IMAGE} (platform: ${PLATFORM})"
 
     if [ "$PUSH" = "1" ] || [ "$PUSH" = "true" ]; then
-        docker buildx build --platform "${PLATFORM}" -f Dockerfile.base -t "${FULL_IMAGE}" --push .
+        docker buildx build --platform "${PLATFORM}" -f "${BASE_DOCKERFILE}" -t "${FULL_IMAGE}" --push .
         echo "Built and pushed: ${FULL_IMAGE}"
     else
-        docker buildx build --platform "${PLATFORM}" -f Dockerfile.base -t "${FULL_IMAGE}" --load .
+        docker buildx build --platform "${PLATFORM}" -f "${BASE_DOCKERFILE}" -t "${FULL_IMAGE}" --load .
         echo "Built: ${FULL_IMAGE}"
     fi
 else
     IMAGE_NAME="${IMAGE_NAME:-ghcr.io/maxbittker/rs-agent-benchmark}"
     IMAGE_TAG="${IMAGE_TAG:-latest}"
+    BASE_IMAGE="${BASE_IMAGE:-ghcr.io/maxbittker/rs-agent-benchmark-base:v2}"
     FULL_IMAGE="${IMAGE_NAME}:${IMAGE_TAG}"
-    echo "Building APP image: ${FULL_IMAGE} (platform: ${PLATFORM})"
+    echo "Building APP image: ${FULL_IMAGE} (platform: ${PLATFORM}, base: ${BASE_IMAGE})"
 
     # Copy shared scripts from shared/ (single source of truth)
     cp ../shared/skill_tracker.ts skill_tracker.ts
@@ -59,16 +62,20 @@ else
 
     if [ "$PUSH" = "1" ] || [ "$PUSH" = "true" ]; then
         docker buildx build --platform "${PLATFORM}" \
+            --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
             --build-arg "RS_SDK_REPO=${RS_SDK_REPO}" \
             --build-arg "RS_SDK_REF=${RS_SDK_REF}" \
             --build-arg "RS_SDK_COMMIT=${RS_SDK_COMMIT}" \
+            -f "${APP_DOCKERFILE}" \
             -t "${FULL_IMAGE}" --push .
         echo "Built and pushed: ${FULL_IMAGE} (rs-sdk ${RS_SDK_COMMIT})"
     else
         docker buildx build --platform "${PLATFORM}" \
+            --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
             --build-arg "RS_SDK_REPO=${RS_SDK_REPO}" \
             --build-arg "RS_SDK_REF=${RS_SDK_REF}" \
             --build-arg "RS_SDK_COMMIT=${RS_SDK_COMMIT}" \
+            -f "${APP_DOCKERFILE}" \
             -t "${FULL_IMAGE}" --load .
         echo "Built: ${FULL_IMAGE} (rs-sdk ${RS_SDK_COMMIT})"
     fi

@@ -168,6 +168,8 @@ export const MODEL_PRICING: Record<string, ModelPricing> = {
   // agents/laguna_adapter.py (cost declared in opencode.json → OpenCode reports
   // real cost_usd; postprocess-costs needs --force to override it).
   laguna:       { input: 0.1e-6,    cachedInput: 0.01e-6,  cacheWrite: 0.1e-6,    output: 0.2e-6 },
+  // poolside/laguna-xs-2.1:free, OpenRouter free endpoint.
+  'laguna-free': { input: 0,        cachedInput: 0,        cacheWrite: 0,        output: 0 },
 };
 
 /** By Harbor model ID (provider/name). Aliased to MODEL_PRICING entries. */
@@ -230,6 +232,7 @@ export const HARBOR_MODEL_PRICING: Record<string, string> = {
   'openrouter/meta/muse-spark-1.1':    'muse',
   'openrouter/thinkingmachines/inkling': 'inkling',
   'openrouter/poolside/laguna-s-2.1':  'laguna',
+  'openrouter/poolside/laguna-xs-2.1:free': 'laguna-free',
 };
 
 /** Look up pricing by either internal label or Harbor model ID. */
@@ -259,7 +262,9 @@ export function computeCost(
 ): number | null {
   const p = getPricing(modelKey);
   if (!p) return null;
-  if (p.input === 0 && p.output === 0) return null; // not yet priced
+  // A known zero-rate model (for example an OpenRouter :free endpoint) is
+  // priced, just at $0. Unknown/unpriced models are handled by the null below.
+  if (p.input === 0 && p.cachedInput === 0 && p.cacheWrite === 0 && p.output === 0) return 0;
   const nonCached = Math.max(0, inputTokens - cacheTokens);
   return (
     nonCached * p.input +

@@ -3,11 +3,9 @@
  *
  * Single-skill XP verifier with time-series tracking.
  * Reads SKILL_NAME env var, reports that skill's XP as reward.
- * Also reads skill_tracking.json and embeds time-series data in reward.json
- * so extract-skill-results.ts can find per-sample data.
- *
- * Writes to reward.json: { skill, xp, level, tracking }
- * Writes raw XP to reward.txt for Harbor compatibility.
+ * Also reads skill_tracking.json and writes the rich time-series payload to
+ * runebench-result.json. Harbor 0.21 accepts only numeric reward values in
+ * reward.json, so that file contains the numeric score summary only.
  */
 // @ts-ignore
 import { BotSDK } from '/app/sdk/index';
@@ -108,7 +106,12 @@ async function main() {
             tracking: trackingData,
         };
 
-        writeFileSync('/logs/verifier/reward.json', JSON.stringify(rewardObj, null, 2));
+        writeFileSync('/logs/verifier/runebench-result.json', JSON.stringify(rewardObj, null, 2));
+        writeFileSync('/logs/verifier/reward.json', JSON.stringify({
+            peakXpRate,
+            xp,
+            level,
+        }, null, 2));
         writeFileSync('/logs/verifier/reward.txt', peakXpRate.toString());
 
         console.log(`Reward: peakXpRate=${peakXpRate} XP/min, xp=${xp}, level=${level}`);
@@ -127,12 +130,17 @@ main().catch(err => {
     try {
         mkdirSync('/logs/verifier', { recursive: true });
         writeFileSync('/logs/verifier/reward.txt', '0');
-        writeFileSync('/logs/verifier/reward.json', JSON.stringify({
+        writeFileSync('/logs/verifier/runebench-result.json', JSON.stringify({
             skill: SKILL_NAME,
             peakXpRate: 0,
             xp: 0,
             level: 1,
             error: err.message,
+        }));
+        writeFileSync('/logs/verifier/reward.json', JSON.stringify({
+            peakXpRate: 0,
+            xp: 0,
+            level: 1,
         }));
     } catch {}
     process.exit(1);

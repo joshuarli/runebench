@@ -155,6 +155,14 @@ function detectGoldVariant(dirName: string, jobDir: string): string {
 }
 
 function findGoldRewardInTrial(trialDir: string): GoldReward | null {
+  const richResultPath = join(trialDir, 'verifier', 'runebench-result.json');
+  if (existsSync(richResultPath)) {
+    try {
+      const reward = JSON.parse(readFileSync(richResultPath, 'utf-8'));
+      if (typeof reward.gold === 'number') return reward;
+    } catch {}
+  }
+
   const rewardPath = join(trialDir, 'verifier', 'reward.json');
   if (existsSync(rewardPath)) {
     try {

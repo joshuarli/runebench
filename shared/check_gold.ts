@@ -182,9 +182,10 @@ function main() {
             }
         }
         writeFileSync('/logs/verifier/reward.txt', '0');
-        writeFileSync('/logs/verifier/reward.json', JSON.stringify({
+        writeFileSync('/logs/verifier/runebench-result.json', JSON.stringify({
             gold: 0, inventoryGold: 0, bankGold: 0, error: 'no save file found',
         }));
+        writeFileSync('/logs/verifier/reward.json', JSON.stringify({ gold: 0 }));
         // Still print stdout markers for recovery
         console.log('__REWARD_JSON_START__');
         console.log(JSON.stringify({ gold: 0, inventoryGold: 0, bankGold: 0, error: 'no save file found' }));
@@ -280,7 +281,15 @@ function main() {
         tracking: trackingData,
     };
 
-    writeFileSync('/logs/verifier/reward.json', JSON.stringify(rewardObj, null, 2));
+    writeFileSync('/logs/verifier/runebench-result.json', JSON.stringify(rewardObj, null, 2));
+    writeFileSync('/logs/verifier/reward.json', JSON.stringify({
+        gold: peakGold,
+        peakGold,
+        finalGold: totalGold,
+        inventoryGold,
+        bankGold,
+        totalLevel,
+    }, null, 2));
     writeFileSync('/logs/verifier/reward.txt', peakGold.toString());
 
     console.log(`Reward: gold=${peakGold} (peak); finalGold=${totalGold}${peakAtMs != null ? ` (peak at ${(peakAtMs/1000).toFixed(0)}s)` : ''}`);
