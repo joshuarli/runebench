@@ -622,8 +622,13 @@ async function main(): Promise<number> {
   }
 
   const expectedPrompt = taskPrompt();
-  if (!process.env.OPENROUTER_API_KEY) {
-    console.error("[pi-live] OPENROUTER_API_KEY is not present; use vault OPENROUTER_API_KEY -- ...");
+  const credentialName = model.startsWith("commandcode/")
+    ? "COMMANDCODE_API_KEY"
+    : "OPENROUTER_API_KEY";
+  if (!process.env[credentialName]) {
+    console.error(
+      "[pi-live] " + credentialName + " is not present; use vault " + credentialName + " -- ...",
+    );
     return 2;
   }
 
