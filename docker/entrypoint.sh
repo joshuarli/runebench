@@ -2,9 +2,9 @@
 set -e
 
 # ── Xvfb virtual display ─────────────────────────────────────────
-# Pi's minimal image keeps Xvfb because the browser game client still uses a
+# The agent-core image keeps Xvfb because the browser game client still uses a
 # rendered display. It disables only recording/audio, not the game client.
-PI_MINIMAL="${PI_MINIMAL:-0}"
+AGENT_CORE_MINIMAL="${AGENT_CORE_MINIMAL:-0}"
 XVFB_PID=""
 echo "[entrypoint] Starting Xvfb virtual display..."
 Xvfb :99 -screen 0 800x600x24 -ac &
@@ -16,8 +16,8 @@ sleep 1
 # Explicit socket + PULSE_SERVER so chromium (started later, inherits
 # this env) and ffmpeg talk to the same daemon regardless of XDG dirs.
 AUDIO_OK=false
-if [ "$PI_MINIMAL" = "1" ]; then
-    echo "[entrypoint] Pi minimal image: PulseAudio disabled"
+if [ "$AGENT_CORE_MINIMAL" = "1" ]; then
+    echo "[entrypoint] Agent-core minimal image: PulseAudio disabled"
 else
     echo "[entrypoint] Starting PulseAudio..."
     export PULSE_SERVER=unix:/tmp/pulse.sock

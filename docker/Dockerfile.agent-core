@@ -1,0 +1,98 @@
+# syntax=docker/dockerfile:1.7
+ARG BASE_IMAGE=runebench-base:local-arm64-agent-core
+
+# The Rust compiler is intentionally the exact nightly pinned by
+# pi-agent-core-rs/rust-toolchain.toml.  The official Rust image publishes
+# rolling nightly tags only, so install the pinned toolchain with rustup rather
+# than silently compiling with a newer (or stable) compiler.
+FROM debian:bookworm AS pi_agent_builder
+ARG RUST_TOOLCHAIN=nightly-2026-07-24
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates curl build-essential \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN"
+ENV PATH=/root/.cargo/bin:${PATH}
+WORKDIR /src
+COPY --from=pi_agent_core Cargo.toml Cargo.lock rust-toolchain.toml /src/pi-agent-core-rs/
+COPY --from=pi_agent_core crates /src/pi-agent-core-rs/crates
+COPY --from=pi_agent_core parity/profile /src/pi-agent-core-rs/parity/profile
+COPY agents/pi-agent-runebench /src/runebench/agents/pi-agent-runebench
+WORKDIR /src/runebench/agents/pi-agent-runebench
+# rustc reports its commit date, not rustup's channel date.  Assert the
+# installed channel itself before compiling with its explicit selector.
+RUN rustup toolchain list | grep -q '^nightly-2026-07-24'
+RUN rustc +nightly-2026-07-24 --version | grep -q nightly
+RUN cargo +nightly-2026-07-24 build --release --locked
+
+FROM ${BASE_IMAGE}
+
+ENV NODE_TICKRATE=50
+ENV AGENT_CORE_MINIMAL=1
+ENV RECORD_VIDEO=0
+ENV GATEWAY_URL=ws://localhost:7780
+
+ARG RS_SDK_REPO=https://github.com/MaxBittker/rs-sdk.git
+ARG RS_SDK_REF=main
+ARG RS_SDK_COMMIT=unknown
+
+RUN git clone --depth 1 --branch $RS_SDK_REF $RS_SDK_REPO /app \
+    && git -C /app rev-parse HEAD > /app/.rs-sdk-commit \
+    && rm -rf /app/.git \
+    && echo "baked rs-sdk $RS_SDK_REF = $(cat /app/.rs-sdk-commit) (requested: $RS_SDK_COMMIT)" \
+    && if [ "$RS_SDK_COMMIT" != "unknown" ] && [ "$(cat /app/.rs-sdk-commit)" != "$RS_SDK_COMMIT" ]; then \
+         echo "FATAL: baked SDK $(cat /app/.rs-sdk-commit) != requested $RS_SDK_COMMIT" >&2; \
+         exit 1; \
+       fi
+
+WORKDIR /app
+RUN bun install
+RUN cd server/engine && bun install
+RUN cd server/gateway && bun install
+RUN cd server/webclient && bun install && bun run build
+RUN cp -r server/webclient/out/bot server/engine/public/bot
+RUN rm -rf /app/scripts /app/sdk/test
+
+RUN cd server/engine && bun run build
+RUN cd server/engine && \
+    bun run src/app.ts > /tmp/engine.log 2>&1 & \
+    for i in $(seq 1 300); do \
+        grep -q "World ready" /tmp/engine.log 2>/dev/null && break; \
+        sleep 1; \
+    done; \
+    ok=0; \
+    for i in $(seq 1 60); do \
+        if curl -sf -o /dev/null http://localhost:8888/versionlist0; then ok=1; break; fi; \
+        sleep 1; \
+    done; \
+    kill $(jobs -p) 2>/dev/null; \
+    if [ "$ok" != "1" ]; then \
+        echo "FATAL: /versionlist0 not served — game cache pack is incomplete" >&2; \
+        tail -30 /tmp/engine.log >&2; \
+        exit 1; \
+    fi; \
+    echo "cache pack verified: /versionlist0 serves OK"; \
+    rm -f /tmp/engine.log
+
+RUN mkdir -p bots/agent
+COPY docker/bot.env bots/agent/bot.env
+RUN echo 'SERVER=localhost' >> /app/bots/agent/bot.env
+
+COPY docker/entrypoint.sh /entrypoint.sh
+COPY docker/launch-bot.ts /app/server/gateway/launch-bot.ts
+COPY docker/skill_tracker.ts /app/benchmark/shared/skill_tracker.ts
+COPY docker/check_xp_rate.ts /app/benchmark/shared/check_xp_rate.ts
+RUN chmod +x /entrypoint.sh
+
+RUN test -f /app/mcp/server.ts || (echo "FATAL: /app/mcp/server.ts missing" >&2; exit 1)
+RUN bun -e 'require.resolve("@modelcontextprotocol/sdk/server/mcp.js")' \
+    || (echo "FATAL: @modelcontextprotocol/sdk not installed" >&2; exit 1)
+
+COPY --from=pi_agent_builder /src/runebench/agents/pi-agent-runebench/target/release/pi-agent-runebench /usr/local/bin/runebench-pi-agent
+COPY agents/runebench-policy.luau /app/benchmark/runebench-policy.luau
+COPY agents/runebench_mcp_bridge.ts /app/benchmark/runebench-mcp-bridge.ts
+RUN chmod 755 /usr/local/bin/runebench-pi-agent && mkdir -p /logs
+
+COPY docker/ensure-services.sh /ensure-services.sh
+RUN chmod +x /ensure-services.sh
+
+ENTRYPOINT ["/entrypoint.sh"]

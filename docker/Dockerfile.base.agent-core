@@ -2,9 +2,8 @@ FROM debian:bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Pi still needs Chromium because launch-bot.ts runs the actual browser game
-# client. Xvfb keeps the client in a rendered display, but Pi local runs do not
-# need the optional FFmpeg/PulseAudio recording stack.
+# The agent-core image retains the game client/MCP runtime while omitting
+# unrelated coding-agent CLIs and optional recording/audio support.
 RUN apt-get update && apt-get install -y \
     curl \
     git \

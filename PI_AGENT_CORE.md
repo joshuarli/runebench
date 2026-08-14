@@ -1,0 +1,95 @@
+# pi-agent-core-rs on Runebench
+
+Runebench's local agent path is a concrete world host for
+[`pi-agent-core-rs`](../pi-agent-core-rs). It does not install, invoke, or
+extend the Pi TypeScript SDK/CLI.
+
+The boundary is deliberate:
+
+```text
+OpenRouter key (vault) ──► Rust OpenRouter adapter
+                                 │
+Pi default profile ─────────► pi-agent-core-rs ◄── Luau policy
+                                 │                      │
+                                 │                 prompts + tool declarations
+                                 ▼
+                      explicit rs-agent MCP bridge
+                                 │
+                                 ▼
+                         Runebench game server
+```
+
+The pinned Pi default system prompt and the active `read`, `bash`, `edit`, and
+`write` tools come from the Rust core. The Runebench policy is
+[`agents/runebench-policy.luau`](agents/runebench-policy.luau); it appends the
+game guidance and declares the five `rs-agent` tools. The Rust host rejects
+any policy capability other than those known bindings.
+
+`OPENROUTER_API_KEY` is passed only to the Rust provider adapter. The default
+shell tools receive an explicit `PATH` but no provider credential, and the Bun
+MCP bridge is launched with a cleared environment.
+
+## Local smoke run
+
+```bash
+# Show the resolved Harbor configuration.
+make agent-core-config
+
+# Build native arm64 images, generate the task image reference, and run the
+# five-minute Woodcutting task with the key supplied by the vault.
+make agent-core
+```
+
+The default model is `openrouter/deepseek/deepseek-v4-flash-0731`. Override it
+without changing tracked configuration:
+
+```bash
+AGENT_CORE_MODEL=openrouter/nvidia/nemotron-3.5-lightning:free make agent-core
+AGENT_CORE_TASK=tasks/mining-xp-5m make agent-core
+AGENT_CORE_AGENT_TIMEOUT_MULTIPLIER=0.22 make agent-core
+```
+
+The final command is always executed under:
+
+```bash
+vault OPENROUTER_API_KEY -- ...
+```
+
+If OpenRouter returns HTTP 404, the host reports that a key restricted to Zero
+Data Retention models is a likely cause. Choose a model that OpenRouter marks
+as compatible with that requirement rather than retrying an unavailable model.
+
+## Artifacts and diagnosis
+
+The host writes the following agent artifacts during a trial:
+
+- `agent/pi-agent-core.jsonl`: lifecycle events used by the live monitor.
+- `agent/pi-agent-core.txt`: process output and aggregate token counts.
+- `agent/runebench-pi-agent-core.json`: non-secret policy/MCP startup audit.
+
+`make agent-core` runs the read-only monitor in `scripts/run-pi-live.ts`.
+Harbor remains responsible for container lifecycle, task timeout, verifier, and
+result artifact collection. Use `make agent-core-direct` only when diagnosing
+Harbor itself.
+
+## Image construction
+
+`make agent-core-image` builds a game base image and then an agent-core image.
+The latter uses BuildKit's named `pi_agent_core` context so the Docker build
+copies only `pi-agent-core-rs` source into a Rust builder stage. That stage
+checks the repository's exact `nightly-2026-07-24` compiler before building;
+the final game image contains only the release binary, policy, and MCP bridge.
+
+The default cloud image and ordinary `bun generate-tasks.ts` workflow remain
+unchanged. The local agent-core image is selected only through
+`RUNEBENCH_DOCKER_IMAGE` in the make targets.
+
+## Extending the policy
+
+Edit `agents/runebench-policy.luau` to change Runebench-specific prompt text,
+the declared game-tool schemas, or pre-tool allow/block decisions. It cannot
+acquire a new host capability by naming one. Adding a new MCP binding requires
+a corresponding Rust `AgentTool`, a host validation rule, and tests.
+
+For the full extension contract, sandbox behavior, limits, and review checklist
+see [`pi-agent-core-rs/LUA.md`](../pi-agent-core-rs/LUA.md).

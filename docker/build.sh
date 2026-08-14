@@ -18,6 +18,8 @@ fi
 PLATFORM="${PLATFORM:-linux/amd64}"
 BASE_DOCKERFILE="${BASE_DOCKERFILE:-Dockerfile.base}"
 APP_DOCKERFILE="${DOCKERFILE:-Dockerfile}"
+BUILD_CONTEXT="${BUILD_CONTEXT:-.}"
+PI_AGENT_CORE_CONTEXT="${PI_AGENT_CORE_CONTEXT:-}"
 cd "$(dirname "$0")"
 
 if [ "$BUILD_BASE" = true ]; then
@@ -60,23 +62,30 @@ else
     fi
     echo "  rs-sdk ${RS_SDK_REF} = ${RS_SDK_COMMIT}"
 
+    EXTRA_BUILD_CONTEXT=()
+    if [ -n "$PI_AGENT_CORE_CONTEXT" ]; then
+        EXTRA_BUILD_CONTEXT+=(--build-context "pi_agent_core=${PI_AGENT_CORE_CONTEXT}")
+    fi
+
     if [ "$PUSH" = "1" ] || [ "$PUSH" = "true" ]; then
         docker buildx build --platform "${PLATFORM}" \
+            "${EXTRA_BUILD_CONTEXT[@]}" \
             --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
             --build-arg "RS_SDK_REPO=${RS_SDK_REPO}" \
             --build-arg "RS_SDK_REF=${RS_SDK_REF}" \
             --build-arg "RS_SDK_COMMIT=${RS_SDK_COMMIT}" \
             -f "${APP_DOCKERFILE}" \
-            -t "${FULL_IMAGE}" --push .
+            -t "${FULL_IMAGE}" --push "${BUILD_CONTEXT}"
         echo "Built and pushed: ${FULL_IMAGE} (rs-sdk ${RS_SDK_COMMIT})"
     else
         docker buildx build --platform "${PLATFORM}" \
+            "${EXTRA_BUILD_CONTEXT[@]}" \
             --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
             --build-arg "RS_SDK_REPO=${RS_SDK_REPO}" \
             --build-arg "RS_SDK_REF=${RS_SDK_REF}" \
             --build-arg "RS_SDK_COMMIT=${RS_SDK_COMMIT}" \
             -f "${APP_DOCKERFILE}" \
-            -t "${FULL_IMAGE}" --load .
+            -t "${FULL_IMAGE}" --load "${BUILD_CONTEXT}"
         echo "Built: ${FULL_IMAGE} (rs-sdk ${RS_SDK_COMMIT})"
     fi
 fi

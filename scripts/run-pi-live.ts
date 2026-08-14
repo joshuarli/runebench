@@ -1,13 +1,14 @@
 /**
- * Run one local Pi/Harbor job and report useful health signals while it runs.
+ * Run one local pi-agent-core-rs/Harbor job and report useful health signals while it runs.
  *
  * This deliberately wraps `harbor run` instead of reimplementing any Harbor
  * lifecycle.  The monitor only reads job files and Docker state; Harbor still
  * owns setup, timeouts, verification, artifact transfer, and the exit code.
  *
  * Environment is supplied by Makefile (or can be supplied directly):
- *   PI_TASK, PI_MODEL, PI_THINKING, PI_JOBS_DIR, HARBOR_PROJECT
- *   PI_JOB_NAME, PI_AGENT_TIMEOUT_MULTIPLIER, PI_VERIFIER_TIMEOUT_MULTIPLIER
+ *   AGENT_CORE_TASK, AGENT_CORE_MODEL, AGENT_CORE_JOBS_DIR, HARBOR_PROJECT
+ *   AGENT_CORE_JOB_NAME, AGENT_CORE_AGENT_TIMEOUT_MULTIPLIER,
+ *   AGENT_CORE_VERIFIER_TIMEOUT_MULTIPLIER
  */
 
 import {
@@ -59,7 +60,7 @@ type TrialSnapshot = {
   phase: string;
   pi: PiSnapshot;
   container: ContainerSnapshot | null;
-  thinkingConfigured: boolean;
+  agentCoreConfigured: boolean;
   promptAudit: "ok" | "missing" | "pending" | "not-applicable";
   result: JsonRecord | null;
   warnings: string[];
@@ -67,19 +68,18 @@ type TrialSnapshot = {
 };
 
 const root = process.cwd();
-const task = process.env.PI_TASK || "tasks/woodcutting-xp-5m";
-const model = process.env.PI_MODEL || "openrouter/deepseek/deepseek-v4-flash-0731";
-const thinking = process.env.PI_THINKING || "high";
-const jobsDir = resolve(root, process.env.PI_JOBS_DIR || "jobs");
+const task = process.env.AGENT_CORE_TASK || "tasks/woodcutting-xp-5m";
+const model = process.env.AGENT_CORE_MODEL || "openrouter/deepseek/deepseek-v4-flash-0731";
+const jobsDir = resolve(root, process.env.AGENT_CORE_JOBS_DIR || "jobs");
 const harborProject = resolve(
   root,
   process.env.HARBOR_PROJECT || `${process.env.HOME || ""}/d/harbor`,
 );
 const taskPath = resolve(root, task);
 const taskSlug = basename(taskPath);
-const intervalMs = Number(process.env.PI_LIVE_INTERVAL_MS || 5000);
-const stalePiSec = Number(process.env.PI_LIVE_PI_STALE_SEC || 90);
-const staleTrackerSec = Number(process.env.PI_LIVE_TRACKER_STALE_SEC || 35);
+const intervalMs = Number(process.env.AGENT_CORE_LIVE_INTERVAL_MS || 5000);
+const stalePiSec = Number(process.env.AGENT_CORE_LIVE_LOG_STALE_SEC || 90);
+const staleTrackerSec = Number(process.env.AGENT_CORE_LIVE_TRACKER_STALE_SEC || 35);
 
 function slug(value: string): string {
   return value
@@ -96,10 +96,10 @@ function defaultJobName(): string {
     .replace(/[-:]/g, "")
     .replace(/\.\d{3}Z$/, "")
     .replace("T", "-");
-  return `pi-${slug(taskSlug)}-${slug(model)}-${stamp}`;
+  return `agent-core-${slug(taskSlug)}-${slug(model)}-${stamp}`;
 }
 
-const jobName = process.env.PI_JOB_NAME || defaultJobName();
+const jobName = process.env.AGENT_CORE_JOB_NAME || defaultJobName();
 const jobDir = resolve(jobsDir, jobName);
 
 function decode(value: Uint8Array | string | null | undefined): string {
@@ -182,7 +182,7 @@ export function isProviderErrorEvent(event: JsonRecord): boolean {
 }
 
 function readPiSnapshot(trialPath: string): PiSnapshot {
-  const path = join(trialPath, "agent", "pi.txt");
+  const path = join(trialPath, "agent", "pi-agent-core.jsonl");
   const text = readText(path);
   if (text === null) {
     return {
@@ -354,7 +354,7 @@ function readTracker(containerId: string): TrackerSnapshot | null {
 }
 
 function readBridgeMarker(containerId: string): JsonRecord | null {
-  const result = capture(["docker", "exec", containerId, "cat", "/logs/agent/runebench-pi-bridge.json"]);
+  const result = capture(["docker", "exec", containerId, "cat", "/logs/agent/runebench-pi-agent-core.json"]);
   if (result.code !== 0) return null;
   try {
     return JSON.parse(result.stdout) as JsonRecord;
@@ -387,12 +387,13 @@ function processHealth(processes: string): Record<string, boolean> {
   };
 }
 
-function configuredThinking(trialPath: string): boolean {
+function configuredAgentCore(trialPath: string): boolean {
   const config = readJson(join(trialPath, "config.json"));
-  const configured = config?.agent?.kwargs?.thinking;
-  if (String(configured || "").toLowerCase() === thinking.toLowerCase()) return true;
   const log = readText(join(trialPath, "trial.log")) || "";
-  return new RegExp(`--thinking\\s+${thinking.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}`, "i").test(log);
+  return (
+    JSON.stringify(config || {}).includes("pi_agent_core_adapter:RunebenchPiAgentCore") ||
+    log.includes("pi_agent_core_adapter:RunebenchPiAgentCore")
+  );
 }
 
 function resultFor(trialPath: string): JsonRecord | null {
@@ -407,7 +408,7 @@ function phaseFor(trialPath: string, pi: PiSnapshot): string {
 }
 
 function horizonSeconds(): number | null {
-  const explicit = Number(process.env.PI_HORIZON_SECONDS || "");
+  const explicit = Number(process.env.AGENT_CORE_HORIZON_SECONDS || "");
   if (Number.isFinite(explicit) && explicit > 0) return explicit;
   const match = taskSlug.match(/-(\d+)m(?:$|[-_])/i);
   return match ? Number(match[1]) * 60 : null;
@@ -425,7 +426,7 @@ function classify(
 
   if (pi.providerErrors >= 3) warnings.push(`provider errors=${pi.providerErrors}`);
   if (pi.exists && pi.logAgeSec !== null && pi.logAgeSec > stalePiSec && phase === "agent") {
-    warnings.push(`Pi log stale ${Math.round(pi.logAgeSec)}s`);
+    warnings.push(`agent-core log stale ${Math.round(pi.logAgeSec)}s`);
   }
   if (tracker?.timestamp) {
     const trackerAge = Math.max(0, (Date.now() - Date.parse(tracker.timestamp)) / 1000);
@@ -439,7 +440,7 @@ function classify(
     }
   }
   if (container?.bridge && container.bridge.docsLoaded === false && phase === "agent") {
-    warnings.push("MCP API docs were not loaded into Pi system prompt");
+    warnings.push("MCP API docs were not loaded into the agent-core system prompt");
   }
 
   const horizon = horizonSeconds();
@@ -460,7 +461,7 @@ function classify(
   if (warnings.some((warning) => warning.startsWith("tracker stale") || warning.startsWith("missing "))) {
     return { state: "game-stalled", warnings };
   }
-  if (warnings.some((warning) => warning.startsWith("Pi log stale"))) {
+  if (warnings.some((warning) => warning.startsWith("agent-core log stale"))) {
     return { state: "model-waiting", warnings };
   }
   if (warnings.some((warning) => warning.startsWith("tool "))) {
@@ -493,7 +494,7 @@ function snapshotTrial(name: string, expectedPrompt: string | null, startedAt: n
     phase,
     pi,
     container,
-    thinkingConfigured: configuredThinking(path),
+    agentCoreConfigured: configuredAgentCore(path),
     promptAudit: auditPrompt(pi, expectedPrompt),
     result,
     warnings: classification.warnings,
@@ -524,7 +525,7 @@ function trialLine(trial: TrialSnapshot, startedAt: number): string {
     `${trial.name} phase=${trial.phase} state=${trial.state}`,
     progress,
     `pi=${formatAge(trial.pi.logAgeSec)} tools=${tools} last=${trial.pi.lastTool || trial.pi.lastEvent || "-"}`,
-    `prompt=${trial.promptAudit} thinking=${trial.thinkingConfigured ? "ok" : "pending"}`,
+    `prompt=${trial.promptAudit} agent-core=${trial.agentCoreConfigured ? "ok" : "pending"}`,
     container,
     bridge,
     `run=${formatAge((Date.now() - startedAt) / 1000)}`,
@@ -581,13 +582,11 @@ function harborArgs(): string[] {
     "-e",
     "docker",
     "-a",
-    "pi_adapter:RunebenchPi",
+    "pi_agent_core_adapter:RunebenchPiAgentCore",
     "-m",
     model,
-    "--agent-kwarg",
-    `thinking=${thinking}`,
     "-o",
-    process.env.PI_JOBS_DIR || "jobs",
+    process.env.AGENT_CORE_JOBS_DIR || "jobs",
     "-n",
     "1",
     "-k",
@@ -596,8 +595,8 @@ function harborArgs(): string[] {
     jobName,
     "-y",
   ];
-  const agentTimeout = process.env.PI_AGENT_TIMEOUT_MULTIPLIER;
-  const verifierTimeout = process.env.PI_VERIFIER_TIMEOUT_MULTIPLIER;
+  const agentTimeout = process.env.AGENT_CORE_AGENT_TIMEOUT_MULTIPLIER;
+  const verifierTimeout = process.env.AGENT_CORE_VERIFIER_TIMEOUT_MULTIPLIER;
   if (agentTimeout) args.push("--agent-timeout-multiplier", agentTimeout);
   if (verifierTimeout) args.push("--verifier-timeout-multiplier", verifierTimeout);
   return args;
@@ -606,7 +605,7 @@ function harborArgs(): string[] {
 async function main(): Promise<number> {
   if (process.argv.includes("--help") || process.argv.includes("-h")) {
     console.log("Usage: bun scripts/run-pi-live.ts");
-    console.log("Runs Harbor locally with native Pi and prints read-only health heartbeats.");
+    console.log("Runs Harbor locally with pi-agent-core-rs and prints read-only health heartbeats.");
     return 0;
   }
   if (!existsSync(harborProject)) {
@@ -615,7 +614,7 @@ async function main(): Promise<number> {
   }
   if (existsSync(jobDir)) {
     console.error(`[pi-live] Job directory already exists: ${jobDir}`);
-    console.error("Set PI_JOB_NAME to a new name or remove only that completed job directory.");
+    console.error("Set AGENT_CORE_JOB_NAME to a new name or remove only that completed job directory.");
     return 2;
   }
 
@@ -628,7 +627,7 @@ async function main(): Promise<number> {
   const args = harborArgs();
   console.error(`[pi-live] starting: uv run --project ${harborProject} harbor ${args.join(" ")}`);
   console.error(`[pi-live] job directory: ${jobDir}`);
-  console.error("[pi-live] audits: task prompt, Pi log freshness, thinking level, MCP bridge, tracker, processes");
+  console.error("[pi-live] audits: task prompt, agent-core log freshness, MCP bridge, tracker, processes");
 
   const startedAt = Date.now();
   const child = Bun.spawn(["uv", "run", "--project", harborProject, "harbor", ...args], {

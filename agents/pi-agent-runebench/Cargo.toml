@@ -1,0 +1,17 @@
+[package]
+name = "pi-agent-runebench"
+version = "0.1.0"
+edition = "2021"
+description = "Runebench host for pi-agent-core-rs"
+license = "MIT"
+
+# This is an application crate intentionally outside the pi-agent-core-rs
+# workspace. It pins its Rust compiler through that repository's toolchain file
+# in the container build, while its dependencies remain explicit here.
+[workspace]
+
+[dependencies]
+pi-agent-core = { path = "../../../pi-agent-core-rs/crates/pi-agent-core" }
+pi-agent-luau = { path = "../../../pi-agent-core-rs/crates/pi-agent-luau" }
+pi-agent-protocol = { path = "../../../pi-agent-core-rs/crates/pi-agent-protocol" }
+smol = "=2.0.2"

@@ -1,0 +1,8 @@
+.git
+jobs
+results
+node_modules
+tasks
+views
+agents/__pycache__
+agents/pi-agent-runebench/target

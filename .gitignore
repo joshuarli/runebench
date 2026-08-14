@@ -1,3 +1,5 @@
+agents/pi-agent-runebench/target
+
 # Generated task directories — regenerate with: bun generate-tasks.ts
 tasks/
 

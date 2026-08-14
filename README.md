@@ -34,42 +34,44 @@ bun generate-tasks.ts
 harbor run
 ```
 
-### Local Pi smoke run
+### Local pi-agent-core-rs smoke run
 
-The repository includes a local Pi path using the latest Harbor checkout and
-Pi's current `@earendil-works/pi-coding-agent` package. The Pi adapter bridges
-Runebench's `rs-agent` MCP server into Pi custom tools, because Pi intentionally
-does not include built-in MCP.
+The local Runebench path uses `pi-agent-core-rs` directly—there is no Pi
+TypeScript SDK or Pi CLI in this workflow. The Rust host uses the core's pinned
+Pi default profile, then loads a Runebench Luau policy that declares the
+`rs-agent` game tools. Rust binds those declarations to the task's MCP server.
 
 ```bash
-# Verify the resolved Harbor/Pi task configuration without running a task.
-make pi-config
+# Verify the resolved Harbor task configuration without running a task.
+make agent-core-config
 
 # Build native arm64 images and run the five-minute woodcutting smoke task locally.
-make pi
+make agent-core
 
 # Override the task, model, or Harbor checkout when needed.
-PI_TASK=tasks/mining-xp-5m make pi
-PI_MODEL=openrouter/poolside/laguna-xs-2.1:free make pi
-HARBOR_PROJECT=/path/to/harbor make pi
+AGENT_CORE_TASK=tasks/mining-xp-5m make agent-core
+AGENT_CORE_MODEL=openrouter/nvidia/nemotron-3.5-lightning:free make agent-core
+HARBOR_PROJECT=/path/to/harbor make agent-core
 ```
 
-`make pi` builds `runebench-base:local-arm64-pi` and `runebench:local-arm64-pi`
+`make agent-core` builds `runebench-base:local-arm64-agent-core` and
+`runebench:local-arm64-agent-core`
 locally, so Apple Silicon uses native containers rather than emulating the
-published amd64 image. The Pi image omits the optional audio/video recording
-stack and other coding-agent CLIs; Chromium remains because it runs the game
-client. The default published image remains unchanged for
+published amd64 image. The agent-core image omits the optional audio/video
+recording stack and other coding-agent CLIs; Chromium remains because it runs
+the game client. The default published image remains unchanged for
 ordinary `bun generate-tasks.ts` and cloud workflows.
 
-`make pi` expects `vault OPENROUTER_API_KEY -- ...` to provide the key to the
-local Harbor process. Its default is the paid
-`deepseek/deepseek-v4-flash-0731` endpoint with Pi `thinking=high`; OpenRouter
-model IDs and thinking level are overrideable through `PI_MODEL` and
-`PI_THINKING`. The command uses a read-only live wrapper around `harbor run` to
-report Pi-log, tracker, process, prompt, MCP-bridge, and provider health.
+`make agent-core` expects `vault OPENROUTER_API_KEY -- ...` to provide the key
+to the local Harbor process. Its default is
+`deepseek/deepseek-v4-flash-0731`; the OpenRouter model ID is overrideable with
+`AGENT_CORE_MODEL`. The command uses a read-only live wrapper around `harbor
+run` to report agent-core log, tracker, process, prompt, MCP-bridge, and
+provider health.
 
-See [PI.md](PI.md) for the full leaderboard workflow, graph-generation path,
-cost guidance, and a breakdown of the Pi/MCP adapter.
+See [PI_AGENT_CORE.md](PI_AGENT_CORE.md) for the core-host/MCP architecture and
+full local workflow. Luau extension authors should start with
+[`pi-agent-core-rs/LUA.md`](../pi-agent-core-rs/LUA.md).
 
 ## Architecture
 

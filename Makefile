@@ -1,80 +1,78 @@
 SHELL := /bin/bash
 
 HARBOR_PROJECT ?= $(HOME)/d/harbor
-PI_MODEL ?= openrouter/deepseek/deepseek-v4-flash-0731
-PI_THINKING ?= high
-PI_TASK ?= tasks/woodcutting-xp-5m
-PI_JOBS_DIR ?= jobs
-PI_PLATFORM ?= linux/arm64
-PI_BASE_IMAGE ?= runebench-base:local-arm64-pi
-PI_IMAGE ?= runebench:local-arm64-pi
-PI_BASE_DOCKERFILE ?= Dockerfile.base.pi
-PI_DOCKERFILE ?= Dockerfile.pi
-PI_BASE_REPO := $(word 1,$(subst :, ,$(PI_BASE_IMAGE)))
-PI_BASE_TAG := $(word 2,$(subst :, ,$(PI_BASE_IMAGE)))
-PI_REPO := $(word 1,$(subst :, ,$(PI_IMAGE)))
-PI_TAG := $(word 2,$(subst :, ,$(PI_IMAGE)))
+AGENT_CORE_MODEL ?= openrouter/deepseek/deepseek-v4-flash-0731
+AGENT_CORE_TASK ?= tasks/woodcutting-xp-5m
+AGENT_CORE_JOBS_DIR ?= jobs
+AGENT_CORE_PLATFORM ?= linux/arm64
+AGENT_CORE_BASE_IMAGE ?= runebench-base:local-arm64-agent-core
+AGENT_CORE_IMAGE ?= runebench:local-arm64-agent-core
+AGENT_CORE_BASE_DOCKERFILE ?= Dockerfile.base.agent-core
+AGENT_CORE_DOCKERFILE ?= Dockerfile.agent-core
+AGENT_CORE_BASE_REPO := $(word 1,$(subst :, ,$(AGENT_CORE_BASE_IMAGE)))
+AGENT_CORE_BASE_TAG := $(word 2,$(subst :, ,$(AGENT_CORE_BASE_IMAGE)))
+AGENT_CORE_REPO := $(word 1,$(subst :, ,$(AGENT_CORE_IMAGE)))
+AGENT_CORE_TAG := $(word 2,$(subst :, ,$(AGENT_CORE_IMAGE)))
 
-.PHONY: pi pi-image pi-generate pi-config pi-direct
+.PHONY: agent-core agent-core-image agent-core-generate agent-core-config agent-core-direct
 
-pi-image:
-	@echo "Building native $(PI_PLATFORM) base image $(PI_BASE_IMAGE)"
+agent-core-image:
+	@echo "Building native $(AGENT_CORE_PLATFORM) base image $(AGENT_CORE_BASE_IMAGE)"
 	@cd docker && \
-	  PLATFORM="$(PI_PLATFORM)" \
-	  BASE_DOCKERFILE="$(PI_BASE_DOCKERFILE)" \
-	  IMAGE_NAME="$(PI_BASE_REPO)" \
-	  IMAGE_TAG="$(PI_BASE_TAG)" \
+	  PLATFORM="$(AGENT_CORE_PLATFORM)" \
+	  BASE_DOCKERFILE="$(AGENT_CORE_BASE_DOCKERFILE)" \
+	  IMAGE_NAME="$(AGENT_CORE_BASE_REPO)" \
+	  IMAGE_TAG="$(AGENT_CORE_BASE_TAG)" \
 	  ./build.sh --base
-	@echo "Building native $(PI_PLATFORM) app image $(PI_IMAGE)"
+	@echo "Building native $(AGENT_CORE_PLATFORM) agent-core image $(AGENT_CORE_IMAGE)"
 	@cd docker && \
-	  PLATFORM="$(PI_PLATFORM)" \
-	  BASE_IMAGE="$(PI_BASE_IMAGE)" \
-	  DOCKERFILE="$(PI_DOCKERFILE)" \
-	  IMAGE_NAME="$(PI_REPO)" \
-	  IMAGE_TAG="$(PI_TAG)" \
+	  PLATFORM="$(AGENT_CORE_PLATFORM)" \
+	  BASE_IMAGE="$(AGENT_CORE_BASE_IMAGE)" \
+	  DOCKERFILE="$(AGENT_CORE_DOCKERFILE)" \
+	  BUILD_CONTEXT=".." \
+	  PI_AGENT_CORE_CONTEXT="../../pi-agent-core-rs" \
+	  IMAGE_NAME="$(AGENT_CORE_REPO)" \
+	  IMAGE_TAG="$(AGENT_CORE_TAG)" \
 	  ./build.sh
 
-pi-generate:
-	@RUNEBENCH_DOCKER_IMAGE="$(PI_IMAGE)" bun generate-tasks.ts
+agent-core-generate:
+	@RUNEBENCH_DOCKER_IMAGE="$(AGENT_CORE_IMAGE)" bun generate-tasks.ts
 
-pi-config:
-	@RUNEBENCH_DOCKER_IMAGE="$(PI_IMAGE)" bun generate-tasks.ts >/dev/null
+agent-core-config:
+	@RUNEBENCH_DOCKER_IMAGE="$(AGENT_CORE_IMAGE)" bun generate-tasks.ts >/dev/null
 	@PYTHONPATH="$(CURDIR)/agents:$${PYTHONPATH:-}" \
 	  uv run --project "$(HARBOR_PROJECT)" harbor run --print-config \
-	  -p "$(PI_TASK)" \
+	  -p "$(AGENT_CORE_TASK)" \
 	  -e docker \
-	  -a 'pi_adapter:RunebenchPi' \
-	  -m "$(PI_MODEL)" \
-	  --agent-kwarg "thinking=$(PI_THINKING)" \
-	  -o "$(PI_JOBS_DIR)" \
+	  -a 'pi_agent_core_adapter:RunebenchPiAgentCore' \
+	  -m "$(AGENT_CORE_MODEL)" \
+	  -o "$(AGENT_CORE_JOBS_DIR)" \
 	  -n 1 -k 1 | jq .
 
-pi: pi-image pi-generate
+agent-core: agent-core-image agent-core-generate
 	@command -v vault >/dev/null || { echo 'vault is required for the OpenRouter key' >&2; exit 1; }
 	@command -v docker >/dev/null || { echo 'docker is required for local Harbor runs' >&2; exit 1; }
-	@echo "Running Pi on $(PI_TASK) with $(PI_MODEL) (thinking=$(PI_THINKING), live monitor=on)"
+	@echo "Running pi-agent-core-rs on $(AGENT_CORE_TASK) with $(AGENT_CORE_MODEL) (live monitor=on)"
 	@PYTHONPATH="$(CURDIR)/agents:$${PYTHONPATH:-}" \
-	  PI_TASK="$(PI_TASK)" \
-	  PI_MODEL="$(PI_MODEL)" \
-	  PI_THINKING="$(PI_THINKING)" \
-	  PI_JOBS_DIR="$(PI_JOBS_DIR)" \
-	  PI_AGENT_TIMEOUT_MULTIPLIER="$(PI_AGENT_TIMEOUT_MULTIPLIER)" \
-	  PI_VERIFIER_TIMEOUT_MULTIPLIER="$(PI_VERIFIER_TIMEOUT_MULTIPLIER)" \
-	  PI_JOB_NAME="$(PI_JOB_NAME)" \
+	  AGENT_CORE_TASK="$(AGENT_CORE_TASK)" \
+	  AGENT_CORE_MODEL="$(AGENT_CORE_MODEL)" \
+	  AGENT_CORE_JOBS_DIR="$(AGENT_CORE_JOBS_DIR)" \
+	  AGENT_CORE_AGENT_TIMEOUT_MULTIPLIER="$(AGENT_CORE_AGENT_TIMEOUT_MULTIPLIER)" \
+	  AGENT_CORE_VERIFIER_TIMEOUT_MULTIPLIER="$(AGENT_CORE_VERIFIER_TIMEOUT_MULTIPLIER)" \
+	  AGENT_CORE_JOB_NAME="$(AGENT_CORE_JOB_NAME)" \
 	  vault OPENROUTER_API_KEY -- \
 	  bun scripts/run-pi-live.ts
 
 # Escape hatch for diagnosing Harbor without the live wrapper. Normal runs
-# should use `make pi`, which adds a deterministic job name and health output.
-pi-direct: pi-image pi-generate
+# should use `make agent-core`, which adds a deterministic job name and health output.
+agent-core-direct: agent-core-image agent-core-generate
 	@command -v vault >/dev/null || { echo 'vault is required for the OpenRouter key' >&2; exit 1; }
 	@PYTHONPATH="$(CURDIR)/agents:$${PYTHONPATH:-}" \
 	  vault OPENROUTER_API_KEY -- \
 	  uv run --project "$(HARBOR_PROJECT)" harbor run \
-	  -p "$(PI_TASK)" \
+	  -p "$(AGENT_CORE_TASK)" \
 	  -e docker \
-	  -a 'pi_adapter:RunebenchPi' \
-	  -m "$(PI_MODEL)" \
-	  --agent-kwarg "thinking=$(PI_THINKING)" \
-	  -o "$(PI_JOBS_DIR)" \
+	  -a 'pi_agent_core_adapter:RunebenchPiAgentCore' \
+	  -m "$(AGENT_CORE_MODEL)" \
+	  -o "$(AGENT_CORE_JOBS_DIR)" \
 	  -n 1 -k 1 -y
