@@ -2,6 +2,8 @@ SHELL := /bin/bash
 
 HARBOR_PROJECT ?= $(HOME)/d/harbor
 AGENT_CORE_MODEL ?= openrouter/deepseek/deepseek-v4-flash-0731
+AGENT_CORE_COMMANDCODE_MODEL ?= commandcode/poolside/laguna-s-2.1-free
+AGENT_CORE_COMMANDCODE_ENV_FILE ?=
 AGENT_CORE_TASK ?= tasks/woodcutting-xp-5m
 AGENT_CORE_JOBS_DIR ?= jobs
 AGENT_CORE_RUN_DEADLINE_SEC ?= 390
@@ -15,7 +17,7 @@ AGENT_CORE_BASE_TAG := $(word 2,$(subst :, ,$(AGENT_CORE_BASE_IMAGE)))
 AGENT_CORE_REPO := $(word 1,$(subst :, ,$(AGENT_CORE_IMAGE)))
 AGENT_CORE_TAG := $(word 2,$(subst :, ,$(AGENT_CORE_IMAGE)))
 
-.PHONY: agent-core agent-core-image agent-core-generate agent-core-config agent-core-direct
+.PHONY: agent-core agent-core-commandcode agent-core-image agent-core-generate agent-core-config agent-core-direct
 
 agent-core-image:
 	@echo "Building native $(AGENT_CORE_PLATFORM) base image $(AGENT_CORE_BASE_IMAGE)"
@@ -64,6 +66,26 @@ agent-core: agent-core-image agent-core-generate
 	  AGENT_CORE_VERIFIER_TIMEOUT_MULTIPLIER="$(AGENT_CORE_VERIFIER_TIMEOUT_MULTIPLIER)" \
 	  AGENT_CORE_JOB_NAME="$(AGENT_CORE_JOB_NAME)" \
 	  vault OPENROUTER_API_KEY -- \
+	  bun scripts/run-pi-live.ts
+
+# Command Code keys are supplied from a caller-selected env file rather than
+# discovered by the Rust core or checked into this repository. The local
+# adapter converts the key into a provider-scoped container environment only.
+agent-core-commandcode: agent-core-image agent-core-generate
+	@test -n "$(AGENT_CORE_COMMANDCODE_ENV_FILE)" || { echo 'AGENT_CORE_COMMANDCODE_ENV_FILE is required' >&2; exit 1; }
+	@test -f "$(AGENT_CORE_COMMANDCODE_ENV_FILE)" || { echo 'AGENT_CORE_COMMANDCODE_ENV_FILE does not exist' >&2; exit 1; }
+	@set -euo pipefail; \
+	  set -a; . "$(AGENT_CORE_COMMANDCODE_ENV_FILE)"; set +a; \
+	  test -n "$${COMMANDCODE_API_KEY:-}" || { echo 'COMMANDCODE_API_KEY is absent from AGENT_CORE_COMMANDCODE_ENV_FILE' >&2; exit 1; }; \
+	  echo "Running pi-agent-core-rs on $(AGENT_CORE_TASK) with $(AGENT_CORE_COMMANDCODE_MODEL) (live monitor=on)"; \
+	  PYTHONPATH="$(CURDIR)/agents:$${PYTHONPATH:-}" \
+	  AGENT_CORE_TASK="$(AGENT_CORE_TASK)" \
+	  AGENT_CORE_MODEL="$(AGENT_CORE_COMMANDCODE_MODEL)" \
+	  AGENT_CORE_JOBS_DIR="$(AGENT_CORE_JOBS_DIR)" \
+	  AGENT_CORE_RUN_DEADLINE_SEC="$(AGENT_CORE_RUN_DEADLINE_SEC)" \
+	  AGENT_CORE_AGENT_TIMEOUT_MULTIPLIER="$(AGENT_CORE_AGENT_TIMEOUT_MULTIPLIER)" \
+	  AGENT_CORE_VERIFIER_TIMEOUT_MULTIPLIER="$(AGENT_CORE_VERIFIER_TIMEOUT_MULTIPLIER)" \
+	  AGENT_CORE_JOB_NAME="$(AGENT_CORE_JOB_NAME)" \
 	  bun scripts/run-pi-live.ts
 
 # Escape hatch for diagnosing Harbor without the live wrapper. Normal runs

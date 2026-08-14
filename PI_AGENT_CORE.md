@@ -7,9 +7,9 @@ extend the Pi TypeScript SDK/CLI.
 The boundary is deliberate:
 
 ```text
-OpenRouter key (vault) ──► Rust OpenRouter adapter
-                                 │
-Pi default profile ─────────► pi-agent-core-rs ◄── Luau policy
+OpenRouter or Command Code key ──► Rust provider adapter
+                                           │
+Pi default profile ───────────────────► pi-agent-core-rs ◄── Luau policy
                                  │                      │
                                  │          prompts + declared coroutine handlers
                                  ▼
@@ -25,9 +25,10 @@ The pinned Pi default system prompt and the active `read`, `bash`, `edit`, and
 game guidance and declares the five `rs-agent` tools. The Rust host rejects
 any policy capability other than those known bindings.
 
-`OPENROUTER_API_KEY` is passed only to the Rust provider adapter. The default
-shell tools receive an explicit `PATH` but no provider credential. The
-Rust-owned MCP client launches its Bun world server with a cleared environment.
+`OPENROUTER_API_KEY` or `COMMANDCODE_API_KEY` is passed only to the selected
+Rust provider adapter. The default shell tools receive an explicit `PATH` but
+no provider credential. The Rust-owned MCP client launches its Bun world server
+with a cleared environment.
 
 ## Local smoke run
 
@@ -59,6 +60,22 @@ vault OPENROUTER_API_KEY -- ...
 If OpenRouter returns HTTP 404, the host reports that a key restricted to Zero
 Data Retention models is a likely cause. Choose a model that OpenRouter marks
 as compatible with that requirement rather than retrying an unavailable model.
+
+## Command Code smoke run
+
+The same host also accepts `commandcode/<model>` names. Its local target takes
+the secret from an explicitly selected environment file, rather than invoking
+the OpenRouter vault boundary:
+
+```bash
+AGENT_CORE_COMMANDCODE_ENV_FILE=../pi-agent-core-rs/.env \
+  make agent-core-commandcode
+```
+
+The default model is `commandcode/poolside/laguna-s-2.1-free`. The Harbor
+adapter creates one UUID per trial and supplies explicit `linux`, date, and
+`runebench` project metadata to the Command Code provider; these values are
+not discovered by `pi-agent-core-rs` itself.
 
 ## Artifacts and diagnosis
 

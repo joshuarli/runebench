@@ -1,6 +1,6 @@
 //! Runebench's concrete world host for the provider-free Pi Rust core.
 //!
-//! This binary intentionally owns OpenRouter transport and the rs-agent MCP
+//! This binary intentionally owns provider selection and the rs-agent MCP
 //! process. `pi-agent-core` remains provider/world agnostic, while the adjacent
 //! Luau policy only declares prompts and explicit tool-policy decisions.
 
@@ -11,6 +11,9 @@ use pi_agent_core::error::{CoreError, HookError};
 use pi_agent_core::event::{AgentEvent, AgentEventKind, EventObserver, ObserverFuture};
 use pi_agent_core::hooks::{AfterToolCall, BeforeToolCall, ContextEnvelope, HookSet, NextTurn};
 use pi_agent_core::profile::PiDefaultCodingProfile;
+use pi_agent_core::provider::commandcode::{
+    CommandCodeConfig, CommandCodeHostContext, CommandCodeProvider,
+};
 use pi_agent_core::scheduler::{
     CancellationToken, ModelFuture, ModelProvider, ModelRequest, ModelStream, ModelStreamEvent,
 };
@@ -61,6 +64,10 @@ struct Args {
     policy: PathBuf,
     log_jsonl: PathBuf,
     run_deadline: Option<Duration>,
+    commandcode_date: Option<String>,
+    commandcode_environment: Option<String>,
+    commandcode_thread_id: Option<String>,
+    commandcode_project_slug: Option<String>,
 }
 
 impl Args {
@@ -98,6 +105,10 @@ impl Args {
                     })
             })
             .transpose()?;
+        let commandcode_date = values.get("--commandcode-date").cloned();
+        let commandcode_environment = values.get("--commandcode-environment").cloned();
+        let commandcode_thread_id = values.get("--commandcode-thread-id").cloned();
+        let commandcode_project_slug = values.get("--commandcode-project-slug").cloned();
         Ok(Self {
             model: required("--model")?,
             instruction: required("--instruction")?,
@@ -105,11 +116,15 @@ impl Args {
             policy: PathBuf::from(required("--policy")?),
             log_jsonl: PathBuf::from(required("--log-jsonl")?),
             run_deadline,
+            commandcode_date,
+            commandcode_environment,
+            commandcode_thread_id,
+            commandcode_project_slug,
         })
     }
 
     fn usage() -> &'static str {
-        "usage: runebench-pi-agent --model <openrouter/model> --instruction <text> --workspace <dir> --policy <file.luau> --log-jsonl <file> [--deadline-seconds <positive-seconds>]"
+        "usage: runebench-pi-agent --model <openrouter/model|commandcode/model> --instruction <text> --workspace <dir> --policy <file.luau> --log-jsonl <file> [--deadline-seconds <positive-seconds>] [--commandcode-date <YYYY-MM-DD> --commandcode-environment <platform> --commandcode-thread-id <UUID> --commandcode-project-slug <slug>]"
     }
 }
 
@@ -265,6 +280,98 @@ impl UsageTotals {
 
     fn snapshot(&self) -> Usage {
         self.0.lock().expect("usage totals lock poisoned").clone()
+    }
+}
+
+/// The provider namespace is part of the benchmark invocation contract, not a
+/// model-name heuristic. It selects both the expected secret and the exact
+/// `ModelDescriptor` namespace seen by the Rust core.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderKind {
+    OpenRouter,
+    CommandCode,
+}
+
+impl ProviderKind {
+    fn descriptor_name(self) -> &'static str {
+        match self {
+            Self::OpenRouter => "openrouter",
+            Self::CommandCode => "command-code",
+        }
+    }
+
+    fn api_key_name(self) -> &'static str {
+        match self {
+            Self::OpenRouter => "OPENROUTER_API_KEY",
+            Self::CommandCode => "COMMANDCODE_API_KEY",
+        }
+    }
+}
+
+/// Host-owned Command Code facts. They are parsed at the command boundary and
+/// passed into the core provider instead of being discovered by that library.
+struct CommandCodeRequestContext {
+    date: String,
+    environment: String,
+    thread_id: String,
+    project_slug: String,
+}
+
+fn parse_model(model: &str) -> Result<(ProviderKind, String), String> {
+    let (provider, model) = if let Some(model) = model.strip_prefix("openrouter/") {
+        (ProviderKind::OpenRouter, model)
+    } else if let Some(model) = model.strip_prefix("commandcode/") {
+        (ProviderKind::CommandCode, model)
+    } else {
+        return Err(
+            "--model must use the openrouter/<model> or commandcode/<model> namespace".into(),
+        );
+    };
+    if model.trim().is_empty() {
+        return Err("--model must include a provider model name".into());
+    }
+    Ok((provider, model.to_owned()))
+}
+
+fn commandcode_request_context(args: &Args) -> Result<CommandCodeRequestContext, String> {
+    let required = |value: &Option<String>, flag: &str| {
+        value
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| format!("commandcode models require {flag}"))
+    };
+    Ok(CommandCodeRequestContext {
+        date: required(&args.commandcode_date, "--commandcode-date")?,
+        environment: required(&args.commandcode_environment, "--commandcode-environment")?,
+        thread_id: required(&args.commandcode_thread_id, "--commandcode-thread-id")?,
+        project_slug: required(&args.commandcode_project_slug, "--commandcode-project-slug")?,
+    })
+}
+
+enum UsageSource {
+    OpenRouter(UsageTotals),
+    CommandCode(Arc<CommandCodeProvider>),
+}
+
+impl UsageSource {
+    fn snapshot(&self) -> Usage {
+        match self {
+            Self::OpenRouter(usage) => usage.snapshot(),
+            Self::CommandCode(provider) => provider.usage_snapshot(),
+        }
+    }
+
+    /// Command Code keeps remote diagnostics separate from agent state. The benchmark host owns
+    /// this private stderr sink, so failed trials retain the provider's status/type/code and
+    /// message without making arbitrary gateway text a model-visible tool result.
+    fn commandcode_error_report(
+        &self,
+    ) -> Option<pi_agent_core::provider::commandcode::CommandCodeErrorReport> {
+        match self {
+            Self::OpenRouter(_) => None,
+            Self::CommandCode(provider) => provider.last_error_report(),
+        }
     }
 }
 
@@ -1154,19 +1261,16 @@ fn load_mcp_docs(
 }
 
 fn run(args: Args) -> Result<(), String> {
-    let api_key = env::var("OPENROUTER_API_KEY").map_err(|_| {
-        "OPENROUTER_API_KEY must be supplied by the caller's secret injector (for example: vault OPENROUTER_API_KEY -- …)".to_owned()
-    })?;
+    let (provider_kind, model) = parse_model(&args.model)?;
+    let commandcode_context = match provider_kind {
+        ProviderKind::OpenRouter => None,
+        ProviderKind::CommandCode => Some(commandcode_request_context(&args)?),
+    };
+    let api_key_name = provider_kind.api_key_name();
+    let api_key = env::var(api_key_name)
+        .map_err(|_| format!("{api_key_name} must be supplied by the caller's secret injector"))?;
     if api_key.trim().is_empty() {
-        return Err("OPENROUTER_API_KEY was empty".to_owned());
-    }
-    let model = args
-        .model
-        .strip_prefix("openrouter/")
-        .unwrap_or(&args.model)
-        .to_owned();
-    if model.trim().is_empty() {
-        return Err("--model must identify an OpenRouter model".to_owned());
+        return Err(format!("{api_key_name} was empty"));
     }
     let policy_source = fs::read_to_string(&args.policy)
         .map_err(|error| format!("cannot read Luau policy {}: {error}", args.policy.display()))?;
@@ -1238,18 +1342,47 @@ fn run(args: Args) -> Result<(), String> {
     );
     write_audit(&args.log_jsonl, docs_loaded)?;
 
-    let usage = UsageTotals::default();
-    let provider: Arc<dyn ModelProvider> = Arc::new(OpenRouterProvider {
-        api_key,
-        model: model.clone(),
-        usage: usage.clone(),
-    });
+    let (provider, usage): (Arc<dyn ModelProvider>, UsageSource) = match provider_kind {
+        ProviderKind::OpenRouter => {
+            let usage = UsageTotals::default();
+            let provider: Arc<dyn ModelProvider> = Arc::new(OpenRouterProvider {
+                api_key,
+                model: model.clone(),
+                usage: usage.clone(),
+            });
+            (provider, UsageSource::OpenRouter(usage))
+        }
+        ProviderKind::CommandCode => {
+            let context = commandcode_context
+                .expect("Command Code context was validated with its provider namespace");
+            let host = CommandCodeHostContext::new(
+                default_tools
+                    .workspace()
+                    .as_path()
+                    .to_string_lossy()
+                    .to_string(),
+                context.date,
+                context.environment,
+            )
+            .map_err(|error| format!("invalid Command Code host context: {error}"))?;
+            let config = CommandCodeConfig::new(api_key, model.clone(), host)
+                .map_err(|error| format!("invalid Command Code configuration: {error}"))?
+                .with_thread_id(context.thread_id)
+                .and_then(|config| config.with_project_slug(context.project_slug))
+                .map_err(|error| format!("invalid Command Code configuration: {error}"))?;
+            let provider = Arc::new(CommandCodeProvider::new(config));
+            (
+                provider.clone() as Arc<dyn ModelProvider>,
+                UsageSource::CommandCode(provider),
+            )
+        }
+    };
     let host_hooks: Arc<dyn HookSet> = Arc::new(OpenAiContextHook);
     let hooks: Arc<dyn HookSet> = Arc::new(LuaPolicyHookSet::new(policy, host_hooks));
     let observer: Arc<dyn EventObserver> = Arc::new(JsonlObserver::create(&args.log_jsonl)?);
     let agent = Agent::builder()
         .model(ModelDescriptor {
-            provider: "openrouter".to_owned(),
+            provider: provider_kind.descriptor_name().to_owned(),
             model,
             revision: None,
         })
@@ -1281,6 +1414,11 @@ fn run(args: Args) -> Result<(), String> {
         totals.output_tokens.unwrap_or(0),
         totals.reasoning_tokens.unwrap_or(0)
     );
+    if result.is_err() {
+        if let Some(report) = usage.commandcode_error_report() {
+            eprintln!("[pi-agent-core] commandcode_error {report}");
+        }
+    }
     match result {
         // Reaching the explicit host deadline is a normal Runebench outcome:
         // the core emitted its cancellation terminal events and the host exits
@@ -1308,8 +1446,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        mcp_client, openrouter_error, parse_openrouter_response, wait_for_child_or_cancellation,
-        write_curl_config, DeadlineGuard, RunebenchMcpCapability,
+        commandcode_request_context, mcp_client, openrouter_error, parse_model,
+        parse_openrouter_response, wait_for_child_or_cancellation, write_curl_config, Args,
+        DeadlineGuard, ProviderKind, RunebenchMcpCapability,
     };
     use pi_agent_core::scheduler::{CancellationToken, ModelStreamEvent};
     use pi_agent_core::state::{SerializedJson, ToolCallId};
@@ -1324,6 +1463,32 @@ mod tests {
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn commandcode_namespace_requires_explicit_host_context() {
+        let (provider, model) =
+            parse_model("commandcode/poolside/laguna-s-2.1-free").expect("model parses");
+        assert_eq!(provider, ProviderKind::CommandCode);
+        assert_eq!(model, "poolside/laguna-s-2.1-free");
+        assert!(parse_model("poolside/laguna-s-2.1-free").is_err());
+
+        let args = Args {
+            model: "commandcode/poolside/laguna-s-2.1-free".into(),
+            instruction: "test".into(),
+            workspace: PathBuf::from("/app"),
+            policy: PathBuf::from("/policy.luau"),
+            log_jsonl: PathBuf::from("/logs/agent.jsonl"),
+            run_deadline: None,
+            commandcode_date: Some("2026-08-14".into()),
+            commandcode_environment: Some("linux".into()),
+            commandcode_thread_id: Some("b51a3243-2dd9-4c81-b659-a039645b7d4e".into()),
+            commandcode_project_slug: Some("runebench".into()),
+        };
+        let context = commandcode_request_context(&args).expect("explicit context parses");
+        assert_eq!(context.date, "2026-08-14");
+        assert_eq!(context.environment, "linux");
+        assert_eq!(context.project_slug, "runebench");
+    }
 
     #[cfg(unix)]
     fn mcp_fixture_script(body: &str) -> PathBuf {

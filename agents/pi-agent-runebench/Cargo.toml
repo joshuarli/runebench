@@ -11,7 +11,7 @@ license = "MIT"
 [workspace]
 
 [dependencies]
-pi-agent-core = { path = "../../../pi-agent-core-rs/crates/pi-agent-core" }
+pi-agent-core = { path = "../../../pi-agent-core-rs/crates/pi-agent-core", features = ["provider-commandcode"] }
 pi-agent-luau = { path = "../../../pi-agent-core-rs/crates/pi-agent-luau" }
 pi-agent-protocol = { path = "../../../pi-agent-core-rs/crates/pi-agent-protocol" }
 smol = "=2.0.2"
