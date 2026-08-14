@@ -245,7 +245,7 @@ impl McpClient {
                 return Err(error);
             }
         };
-        let child = (|| {
+        let child = {
             let mut command = Command::new(&config.command);
             command
                 .args(&config.args)
@@ -261,7 +261,7 @@ impl McpClient {
                 operation: format!("start MCP command {:?}", config.command),
                 message: error.to_string(),
             })
-        })();
+        };
         let mut child = match child {
             Ok(child) => child,
             Err(error) => {
@@ -290,9 +290,7 @@ impl McpClient {
             next_id: 1,
             initialized: false,
         };
-        if let Err(error) = client.initialize(cancellation) {
-            return Err(error);
-        }
+        client.initialize(cancellation)?;
         Ok(client)
     }
 
@@ -633,10 +631,7 @@ fn capture_file(operation: &str, stream: &str) -> Result<(PathBuf, File), McpErr
 /// Poll and reap only the direct child.  Detached world workers deliberately
 /// survive this boundary, matching the host's existing cancellation policy.
 fn terminate_child(child: &mut Child) {
-    match child.try_wait() {
-        Ok(Some(_)) => return,
-        Ok(None) | Err(_) => {}
-    }
+    if let Ok(Some(_)) = child.try_wait() { return }
     let _ = child.kill();
     let _ = child.wait();
 }
