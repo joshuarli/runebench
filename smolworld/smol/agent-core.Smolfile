@@ -1,0 +1,19 @@
+# The archive is host-prepared by `make agent-core-direct-smolworld` from the
+# native agent-core OCI image. Smolworld only seals and runs this local input.
+image = "../agent-core.tar"
+entrypoint = ["/entrypoint.sh"]
+workdir = "/app"
+
+env = [
+  "NODE_TICKRATE=50",
+  "AGENT_CORE_MINIMAL=1",
+  "RECORD_VIDEO=0",
+  "GATEWAY_URL=ws://localhost:7780",
+  "SAMPLE_INTERVAL_MS=15000",
+  "BENCHMARK_DURATION_SECS=300",
+]
+
+cpus = 2
+memory = 8192
+storage = 10
+overlay = 10

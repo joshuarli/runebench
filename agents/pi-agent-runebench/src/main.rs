@@ -726,6 +726,7 @@ fn parse_openrouter_response(
             input_tokens,
             output_tokens,
             reasoning_tokens,
+            ..Usage::default()
         },
     ))
 }
@@ -1121,6 +1122,10 @@ fn event_json(event: &AgentEvent) -> String {
             "{{\"type\":\"turn_end\",\"stopReason\":{}}}",
             json_string(stop_reason_name(*reason))
         ),
+        AgentEventKind::CompactionStart { .. }
+        | AgentEventKind::CompactionResult { .. }
+        | AgentEventKind::CompactionEnd { .. } => "{\"type\":\"compaction\"}".to_owned(),
+        AgentEventKind::ModelTurnUsage { .. } => "{\"type\":\"model_turn_usage\"}".to_owned(),
         AgentEventKind::MessageUpdate { .. } => "{\"type\":\"message_update\"}".to_owned(),
         AgentEventKind::ToolExecutionUpdate { tool_name, .. } => format!(
             "{{\"type\":\"tool_execution_update\",\"toolName\":{}}}",

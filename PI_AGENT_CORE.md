@@ -90,6 +90,18 @@ Harbor remains responsible for container lifecycle, task timeout, verifier, and
 result artifact collection. Use `make agent-core-direct` only when diagnosing
 Harbor itself.
 
+For the Smolworld analogue, use:
+
+```bash
+make agent-core-direct-smolworld
+```
+
+That target exports the native app image into `smolworld/agent-core.tar`,
+seeds the selected task save through the world declaration, and delegates the
+Rust agent host plus generated verifier into the one recorded machine. The
+guest's Rust host launches `/app/mcp/server.ts` directly, so Harbor's Docker
+environment and adapter are not part of this path.
+
 `AGENT_CORE_RUN_DEADLINE_SEC` defaults to 390 seconds for the five-minute
 Woodcutting task, leaving 30 seconds before Harbor's 420-second agent limit.
 The Rust host requests structured cancellation at that deadline and reaps any

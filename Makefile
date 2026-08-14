@@ -16,8 +16,14 @@ AGENT_CORE_BASE_REPO := $(word 1,$(subst :, ,$(AGENT_CORE_BASE_IMAGE)))
 AGENT_CORE_BASE_TAG := $(word 2,$(subst :, ,$(AGENT_CORE_BASE_IMAGE)))
 AGENT_CORE_REPO := $(word 1,$(subst :, ,$(AGENT_CORE_IMAGE)))
 AGENT_CORE_TAG := $(word 2,$(subst :, ,$(AGENT_CORE_IMAGE)))
+AGENT_CORE_SMOLWORLD_ARCHIVE ?= $(CURDIR)/smolworld/agent-core.tar
+AGENT_CORE_SMOLWORLD_VAULT_KEY ?= OPENROUTER_API_KEY
+AGENT_CORE_SMOLWORLD_CREDENTIAL_ENV ?= $(AGENT_CORE_SMOLWORLD_VAULT_KEY)
 
-.PHONY: agent-core agent-core-commandcode agent-core-image agent-core-generate agent-core-config agent-core-direct
+.PHONY: agent-core agent-core-commandcode agent-core-image agent-core-smolworld-image agent-core-generate agent-core-config agent-core-direct agent-core-direct-smolworld smolworld-fixture-check
+
+smolworld-fixture-check:
+	@bash tests/check-smolworld-agent-core-fixture.sh
 
 agent-core-image:
 	@echo "Building native $(AGENT_CORE_PLATFORM) base image $(AGENT_CORE_BASE_IMAGE)"
@@ -37,6 +43,15 @@ agent-core-image:
 	  IMAGE_NAME="$(AGENT_CORE_REPO)" \
 	  IMAGE_TAG="$(AGENT_CORE_TAG)" \
 	  ./build.sh
+
+# Smolworld consumes host-prepared local OCI archives. Keep Docker confined to
+# this preparation step; the benchmark workload, agent host, and MCP server
+# run inside the recorded Smolworld machine after the export.
+agent-core-smolworld-image: agent-core-image
+	@command -v docker >/dev/null || { echo 'docker is required to export the host-prepared Smolworld archive' >&2; exit 1; }
+	@mkdir -p "$(dir $(AGENT_CORE_SMOLWORLD_ARCHIVE))"
+	@echo "Exporting $(AGENT_CORE_IMAGE) to $(AGENT_CORE_SMOLWORLD_ARCHIVE)"
+	@docker save --output "$(AGENT_CORE_SMOLWORLD_ARCHIVE)" "$(AGENT_CORE_IMAGE)"
 
 agent-core-generate:
 	@RUNEBENCH_DOCKER_IMAGE="$(AGENT_CORE_IMAGE)" bun generate-tasks.ts
@@ -102,3 +117,20 @@ agent-core-direct: agent-core-image agent-core-generate
 	  --agent-kwarg "run_deadline_sec=$(AGENT_CORE_RUN_DEADLINE_SEC)" \
 	  -o "$(AGENT_CORE_JOBS_DIR)" \
 	  -n 1 -k 1 -y
+
+# Direct analogue of agent-core-direct using the Smolworld world supervisor.
+# The task image is exported once as local material; no Docker environment or
+# Harbor adapter is involved after that archive has been prepared. Select the
+# provider key with AGENT_CORE_SMOLWORLD_VAULT_KEY and keep the guest variable
+# explicit via AGENT_CORE_SMOLWORLD_CREDENTIAL_ENV.
+agent-core-direct-smolworld: smolworld-fixture-check agent-core-smolworld-image agent-core-generate
+	@command -v vault >/dev/null || { echo 'vault is required for the provider key' >&2; exit 1; }
+	@echo "Running pi-agent-core-rs in Smolworld on $(AGENT_CORE_TASK) with $(AGENT_CORE_MODEL)"
+	@vault "$(AGENT_CORE_SMOLWORLD_VAULT_KEY)" -- \
+	  env \
+	  AGENT_CORE_TASK="$(AGENT_CORE_TASK)" \
+	  AGENT_CORE_MODEL="$(AGENT_CORE_MODEL)" \
+	  AGENT_CORE_RUN_DEADLINE_SEC="$(AGENT_CORE_RUN_DEADLINE_SEC)" \
+	  AGENT_CORE_CREDENTIAL_ENV="$(AGENT_CORE_SMOLWORLD_CREDENTIAL_ENV)" \
+	  AGENT_CORE_SMOLWORLD_ARCHIVE="$(AGENT_CORE_SMOLWORLD_ARCHIVE)" \
+	  bash scripts/run-agent-core-smolworld.sh

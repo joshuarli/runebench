@@ -148,7 +148,10 @@ for pid in $(pgrep -f "bun" 2>/dev/null); do
     *) kill $pid 2>/dev/null || true ;;
   esac
 done
-sleep 2`;
+# The Rust host may end at the benchmark deadline while the engine is still
+# finishing an atomic player-save write. Give the shared verifier a drain
+# window before parsing its final state.
+sleep 10`;
 
 // Thin FROM layer: adds GATEWAY_URL and sample interval on top of base image.
 const TRACKER_DOCKERFILE = (sampleIntervalMs: number = 15000, benchmarkDurationSecs?: number) => `FROM ${DOCKER_IMAGE}

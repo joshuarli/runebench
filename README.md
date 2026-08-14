@@ -48,6 +48,9 @@ make agent-core-config
 # Build native arm64 images and run the five-minute woodcutting smoke task locally.
 make agent-core
 
+# Run the same smoke task in the Smolworld external-NIC VM.
+make agent-core-direct-smolworld
+
 # Override the task, model, or Harbor checkout when needed.
 AGENT_CORE_TASK=tasks/mining-xp-5m make agent-core
 AGENT_CORE_MODEL=openrouter/nvidia/nemotron-3.5-lightning:free make agent-core
@@ -68,6 +71,40 @@ to the local Harbor process. Its default is
 `AGENT_CORE_MODEL`. The command uses a read-only live wrapper around `harbor
 run` to report agent-core log, tracker, process, prompt, MCP-bridge, and
 provider health.
+
+`make agent-core-direct-smolworld` exports the native agent-core image as a
+host-prepared OCI archive, seals `smolworld/.smolworld`, and runs the agent and
+verifier through Smolworld's namespaced exec/copy boundaries. Docker is used
+only to prepare that local archive; the guest uses smolvm's explicit NAT egress
+path at runtime and never pulls the workload image from a registry.
+
+The live target requires a checked-out, patched smolworld/smolvm pair and
+prepared runtime artifacts. For a source checkout, the invocation is:
+
+```bash
+vault COMMANDCODE_API_KEY -- env \
+  PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH" \
+  SMOLWORLD_BIN="$HOME/d/smolworld/target/debug/smolworld" \
+  SMOLWORLD_SMOLVM="$HOME/d/smolvm/target/debug/smolvm" \
+  SMOLVM_AGENT_ROOTFS="$HOME/d/smolvm/target/agent-rootfs" \
+  SMOLVM_LIB_DIR="$HOME/d/smolvm/lib" \
+  DYLD_LIBRARY_PATH="$HOME/d/smolvm/lib" \
+  AGENT_CORE_SMOLWORLD_VAULT_KEY=COMMANDCODE_API_KEY \
+  AGENT_CORE_SMOLWORLD_CREDENTIAL_ENV=COMMANDCODE_API_KEY \
+  AGENT_CORE_MODEL=commandcode/poolside/laguna-s-2.1-free \
+  make agent-core-direct-smolworld
+```
+
+The Make target uses Docker only to build and export the local
+`smolworld/agent-core.tar`; it then runs `prepare`, `check`, the foreground
+world supervisor, guest commands, and exact world cleanup. Teardown retries for
+up to two minutes while the smolworld supervisor's lifecycle lock and VM shutdown
+settle, and reports the last scoped error if cleanup still fails; cleanup failure
+turns an otherwise successful run into a failure. The provider key is
+read by `vault` on the host and passed only to the delegated agent command via
+`--secret-env`; it is not written to the Smolfile, world state, or material
+lock. Override `AGENT_CORE_SMOLWORLD_VAULT_KEY` and
+`AGENT_CORE_SMOLWORLD_CREDENTIAL_ENV` together when using another provider.
 
 See [PI_AGENT_CORE.md](PI_AGENT_CORE.md) for the core-host/MCP architecture and
 full local workflow. Luau extension authors should start with

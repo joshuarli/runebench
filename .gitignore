@@ -40,6 +40,11 @@ results/gold/*
 # Game save state
 # shared/agent.sav
 
+# Host-prepared Smolworld inputs and material lock.
+smolworld/agent-core.tar
+smolworld/agent.sav
+smolworld/.smolworld.lock
+
 # Build artifacts copied by docker/build.sh
 docker/skill_tracker.ts
 docker/check_xp_rate.ts

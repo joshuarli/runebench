@@ -1,0 +1,17 @@
+format: 2
+
+world:
+  name: runebench-agent-core
+
+network:
+  subnet: 10.91.0.0/24
+  domain: runebench-agent-core.test
+  egress: true
+
+machines:
+  agent:
+    smolfile: ./smol/agent-core.Smolfile
+    seed_files:
+      - source: ./agent.sav
+        destination: /app/server/engine/data/players/main/agent.sav
+        mode: "0644"
