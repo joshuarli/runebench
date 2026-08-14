@@ -12,6 +12,50 @@ local granted_tools = {
     write = true,
 }
 
+-- These handlers run in a fresh hermetic Luau VM for each model tool call.
+-- They can yield only an explicitly bound rs-agent capability. Rust validates
+-- the method and the model-visible tool name against its MCP capability
+-- manifest before it sends any JSON-RPC request to the world server.
+local mcp_tool_call_handler = [[
+return function(call)
+    local result = coroutine.yield({
+        kind = "capability",
+        capability = "rs-agent",
+        method = "tools.call",
+        arguments_json = call.arguments_json,
+    })
+    return {
+        content = result.content,
+        details_json = result.details_json,
+        is_error = result.is_error,
+    }
+end
+]]
+
+local mcp_list_resources_handler = [[
+return function(_)
+    local result = coroutine.yield({
+        kind = "capability",
+        capability = "rs-agent",
+        method = "resources.list",
+        arguments_json = "{}",
+    })
+    return { content = result.content, is_error = result.is_error }
+end
+]]
+
+local mcp_read_resource_handler = [[
+return function(call)
+    local result = coroutine.yield({
+        kind = "capability",
+        capability = "rs-agent",
+        method = "resources.read",
+        arguments_json = call.arguments_json,
+    })
+    return { content = result.content, is_error = result.is_error }
+end
+]]
+
 return {
     system_prompt_append = [[
 ## Runebench game tools
@@ -24,6 +68,7 @@ The rs-agent MCP server is bridged into native tools. Use execute_code with bot_
             description = "Execute TypeScript code on the RuneScape bot. The code runs in an async context with bot (BotActions) and sdk (BotSDK) globals.",
             capability = "rs-agent",
             execution_mode = "sequential",
+            handler_source = mcp_tool_call_handler,
             schema_json = [[{"type":"object","properties":{"bot_name":{"type":"string","description":"Bot name; use agent for the Runebench bot."},"code":{"type":"string","description":"TypeScript code. Available globals are bot (BotActions) and sdk (BotSDK)."},"timeout":{"type":"number","description":"Execution timeout in minutes, from 0.1 to 60; default 2.","minimum":0.1,"maximum":60}},"required":["bot_name","code"],"additionalProperties":false}]],
         },
         {
@@ -31,6 +76,7 @@ The rs-agent MCP server is bridged into native tools. Use execute_code with bot_
             description = "List connected RuneScape bots.",
             capability = "rs-agent",
             execution_mode = "sequential",
+            handler_source = mcp_tool_call_handler,
             schema_json = [[{"type":"object","properties":{},"additionalProperties":false}]],
         },
         {
@@ -38,6 +84,7 @@ The rs-agent MCP server is bridged into native tools. Use execute_code with bot_
             description = "Disconnect a connected RuneScape bot.",
             capability = "rs-agent",
             execution_mode = "sequential",
+            handler_source = mcp_tool_call_handler,
             schema_json = [[{"type":"object","properties":{"name":{"type":"string","description":"Bot name to disconnect."}},"required":["name"],"additionalProperties":false}]],
         },
         {
@@ -45,6 +92,7 @@ The rs-agent MCP server is bridged into native tools. Use execute_code with bot_
             description = "List the RuneScape Bot/SDK API documentation resources.",
             capability = "rs-agent",
             execution_mode = "sequential",
+            handler_source = mcp_list_resources_handler,
             schema_json = [[{"type":"object","properties":{},"additionalProperties":false}]],
         },
         {
@@ -52,6 +100,7 @@ The rs-agent MCP server is bridged into native tools. Use execute_code with bot_
             description = "Read a RuneScape Bot/SDK API documentation resource by URI.",
             capability = "rs-agent",
             execution_mode = "sequential",
+            handler_source = mcp_read_resource_handler,
             schema_json = [[{"type":"object","properties":{"uri":{"type":"string","description":"Resource URI returned by list_resources."}},"required":["uri"],"additionalProperties":false}]],
         },
     },

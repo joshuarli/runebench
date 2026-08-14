@@ -8,7 +8,7 @@
  * Environment is supplied by Makefile (or can be supplied directly):
  *   AGENT_CORE_TASK, AGENT_CORE_MODEL, AGENT_CORE_JOBS_DIR, HARBOR_PROJECT
  *   AGENT_CORE_JOB_NAME, AGENT_CORE_AGENT_TIMEOUT_MULTIPLIER,
- *   AGENT_CORE_VERIFIER_TIMEOUT_MULTIPLIER
+ *   AGENT_CORE_VERIFIER_TIMEOUT_MULTIPLIER, AGENT_CORE_RUN_DEADLINE_SEC
  */
 
 import {
@@ -51,7 +51,7 @@ type ContainerSnapshot = {
   status: string;
   processes: string;
   tracker: TrackerSnapshot | null;
-  bridge: JsonRecord | null;
+  agentAudit: JsonRecord | null;
 };
 
 type TrialSnapshot = {
@@ -80,6 +80,7 @@ const taskSlug = basename(taskPath);
 const intervalMs = Number(process.env.AGENT_CORE_LIVE_INTERVAL_MS || 5000);
 const stalePiSec = Number(process.env.AGENT_CORE_LIVE_LOG_STALE_SEC || 90);
 const staleTrackerSec = Number(process.env.AGENT_CORE_LIVE_TRACKER_STALE_SEC || 35);
+const runDeadlineSec = process.env.AGENT_CORE_RUN_DEADLINE_SEC || "390";
 
 function slug(value: string): string {
   return value
@@ -353,7 +354,7 @@ function readTracker(containerId: string): TrackerSnapshot | null {
   }
 }
 
-function readBridgeMarker(containerId: string): JsonRecord | null {
+function readAgentAudit(containerId: string): JsonRecord | null {
   const result = capture(["docker", "exec", containerId, "cat", "/logs/agent/runebench-pi-agent-core.json"]);
   if (result.code !== 0) return null;
   try {
@@ -372,7 +373,7 @@ function readContainer(trialName: string): ContainerSnapshot | null {
     ...found,
     processes: top,
     tracker: readTracker(found.id),
-    bridge: readBridgeMarker(found.id),
+    agentAudit: readAgentAudit(found.id),
   };
 }
 
@@ -439,7 +440,7 @@ function classify(
       if (!health[name]) warnings.push(`missing ${name}`);
     }
   }
-  if (container?.bridge && container.bridge.docsLoaded === false && phase === "agent") {
+  if (container?.agentAudit && container.agentAudit.docsLoaded === false && phase === "agent") {
     warnings.push("MCP API docs were not loaded into the agent-core system prompt");
   }
 
@@ -518,16 +519,16 @@ function trialLine(trial: TrialSnapshot, startedAt: number): string {
     : "tracker=-";
   const tools = `${trial.pi.toolEnds}/${trial.pi.toolStarts}`;
   const container = trial.container ? `docker=${trial.container.name}` : "docker=-";
-  const bridge = trial.container?.bridge
-    ? `bridge=ok${trial.container.bridge.docsLoaded ? "/docs" : "/no-docs"}`
-    : "bridge=-";
+  const mcp = trial.container?.agentAudit
+    ? `mcp=ok${trial.container.agentAudit.docsLoaded ? "/docs" : "/no-docs"}`
+    : "mcp=-";
   return [
     `${trial.name} phase=${trial.phase} state=${trial.state}`,
     progress,
     `pi=${formatAge(trial.pi.logAgeSec)} tools=${tools} last=${trial.pi.lastTool || trial.pi.lastEvent || "-"}`,
     `prompt=${trial.promptAudit} agent-core=${trial.agentCoreConfigured ? "ok" : "pending"}`,
     container,
-    bridge,
+    mcp,
     `run=${formatAge((Date.now() - startedAt) / 1000)}`,
   ].join(" | ");
 }
@@ -585,6 +586,8 @@ function harborArgs(): string[] {
     "pi_agent_core_adapter:RunebenchPiAgentCore",
     "-m",
     model,
+    "--agent-kwarg",
+    `run_deadline_sec=${runDeadlineSec}`,
     "-o",
     process.env.AGENT_CORE_JOBS_DIR || "jobs",
     "-n",
@@ -627,7 +630,7 @@ async function main(): Promise<number> {
   const args = harborArgs();
   console.error(`[pi-live] starting: uv run --project ${harborProject} harbor ${args.join(" ")}`);
   console.error(`[pi-live] job directory: ${jobDir}`);
-  console.error("[pi-live] audits: task prompt, agent-core log freshness, MCP bridge, tracker, processes");
+  console.error("[pi-live] audits: task prompt, agent-core log freshness, MCP client, tracker, processes");
 
   const startedAt = Date.now();
   const child = Bun.spawn(["uv", "run", "--project", harborProject, "harbor", ...args], {

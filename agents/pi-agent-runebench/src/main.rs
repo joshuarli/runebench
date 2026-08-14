@@ -4,8 +4,10 @@
 //! process. `pi-agent-core` remains provider/world agnostic, while the adjacent
 //! Luau policy only declares prompts and explicit tool-policy decisions.
 
+mod mcp_client;
+
 use pi_agent_core::default_tools::CommandEnvironment;
-use pi_agent_core::error::{HookError, ToolError};
+use pi_agent_core::error::{CoreError, HookError};
 use pi_agent_core::event::{AgentEvent, AgentEventKind, EventObserver, ObserverFuture};
 use pi_agent_core::hooks::{AfterToolCall, BeforeToolCall, ContextEnvelope, HookSet, NextTurn};
 use pi_agent_core::profile::PiDefaultCodingProfile;
@@ -15,11 +17,18 @@ use pi_agent_core::scheduler::{
 use pi_agent_core::state::{
     AssistantToolCall, Message, ModelDescriptor, SerializedJson, StopReason, ToolCallId, Usage,
 };
-use pi_agent_core::tool::{
-    AgentTool, ToolCall, ToolContext, ToolExecutionMode, ToolFuture, ToolResult, ToolUpdateSink,
-};
+use pi_agent_core::tool::{ToolCall, ToolResult};
 use pi_agent_core::{Agent, DefaultCodingTools};
-use pi_agent_luau::{LuaPolicy, LuaPolicyHookSet, PolicyTool};
+use pi_agent_luau::capability::{
+    CapabilityGrant, CapabilityManifest, CapabilityModule, CapabilityOperation,
+    McpOperation as GrantedMcpOperation, WorldOperation,
+};
+use pi_agent_luau::tool_handler::{
+    CapabilityBindings, CapabilityError as LuaCapabilityError,
+    CapabilityFuture as LuaCapabilityFuture, CapabilityRequest as LuaCapabilityRequest,
+    CapabilityResponse as LuaCapabilityResponse, LuaToolHandler, LuauCapability, ToolHandlerSpec,
+};
+use pi_agent_luau::{LuaPolicy, LuaPolicyHookSet};
 use pi_agent_protocol::{JsonNumber, JsonValue};
 use std::collections::BTreeMap;
 use std::env;
@@ -28,8 +37,11 @@ use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 const OPENROUTER_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const DEFAULT_SHELL_PATH: &str = "/root/.bun/bin:/usr/local/bin:/usr/bin:/bin";
@@ -40,14 +52,15 @@ const RS_AGENT_TOOL_NAMES: [&str; 5] = [
     "rs_agent_list_resources",
     "rs_agent_read_resource",
 ];
+static PROCESS_CAPTURE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
 struct Args {
     model: String,
     instruction: String,
     workspace: PathBuf,
     policy: PathBuf,
-    mcp_bridge: PathBuf,
     log_jsonl: PathBuf,
+    run_deadline: Option<Duration>,
 }
 
 impl Args {
@@ -72,18 +85,84 @@ impl Args {
                 .cloned()
                 .ok_or_else(|| format!("missing required argument {flag}"))
         };
+        let run_deadline = values
+            .get("--deadline-seconds")
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|seconds| *seconds > 0)
+                    .map(Duration::from_secs)
+                    .ok_or_else(|| {
+                        "--deadline-seconds must be a positive whole number of seconds".to_owned()
+                    })
+            })
+            .transpose()?;
         Ok(Self {
             model: required("--model")?,
             instruction: required("--instruction")?,
             workspace: PathBuf::from(required("--workspace")?),
             policy: PathBuf::from(required("--policy")?),
-            mcp_bridge: PathBuf::from(required("--mcp-bridge")?),
             log_jsonl: PathBuf::from(required("--log-jsonl")?),
+            run_deadline,
         })
     }
 
     fn usage() -> &'static str {
-        "usage: runebench-pi-agent --model <openrouter/model> --instruction <text> --workspace <dir> --policy <file.luau> --mcp-bridge <file.ts> --log-jsonl <file>"
+        "usage: runebench-pi-agent --model <openrouter/model> --instruction <text> --workspace <dir> --policy <file.luau> --log-jsonl <file> [--deadline-seconds <positive-seconds>]"
+    }
+}
+
+/// A host-owned deadline that requests structured core cancellation, then
+/// joins before process exit. The core remains free of timers and threads;
+/// this world host owns the benchmark-specific lifecycle boundary.
+struct DeadlineGuard {
+    disarmed: Arc<(Mutex<bool>, Condvar)>,
+    expired: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl DeadlineGuard {
+    fn arm(deadline: Duration, on_expire: impl FnOnce() + Send + 'static) -> Self {
+        let disarmed = Arc::new((Mutex::new(false), Condvar::new()));
+        let expired = Arc::new(AtomicBool::new(false));
+        let worker_disarmed = Arc::clone(&disarmed);
+        let worker_expired = Arc::clone(&expired);
+        let worker = thread::spawn(move || {
+            let (lock, wake) = &*worker_disarmed;
+            let armed = lock.lock().expect("deadline mutex poisoned");
+            let (armed, waited) = wake
+                .wait_timeout_while(armed, deadline, |disarmed| !*disarmed)
+                .expect("deadline condition variable poisoned");
+            if !*armed && waited.timed_out() {
+                worker_expired.store(true, Ordering::Release);
+                on_expire();
+            }
+        });
+        Self {
+            disarmed,
+            expired,
+            worker: Some(worker),
+        }
+    }
+
+    fn expired(&self) -> bool {
+        self.expired.load(Ordering::Acquire)
+    }
+
+    fn disarm(&mut self) {
+        let (lock, wake) = &*self.disarmed;
+        *lock.lock().expect("deadline mutex poisoned") = true;
+        wake.notify_all();
+        if let Some(worker) = self.worker.take() {
+            worker.join().expect("deadline worker panicked");
+        }
+    }
+}
+
+impl Drop for DeadlineGuard {
+    fn drop(&mut self) {
+        self.disarm();
     }
 }
 
@@ -207,8 +286,13 @@ impl OpenRouterProvider {
                 events: vec![ModelStreamEvent::End(StopReason::Cancelled)],
             };
         }
-        match self.complete(request) {
+        match self.complete(request, &cancellation) {
             Ok((mut events, usage)) => {
+                if cancellation.is_cancelled() {
+                    return ModelStream {
+                        events: vec![ModelStreamEvent::End(StopReason::Cancelled)],
+                    };
+                }
                 self.usage.add(usage.clone());
                 let terminal = events
                     .pop()
@@ -217,15 +301,31 @@ impl OpenRouterProvider {
                 events.push(terminal);
                 ModelStream { events }
             }
+            Err(_message) if cancellation.is_cancelled() => ModelStream {
+                events: vec![ModelStreamEvent::End(StopReason::Cancelled)],
+            },
             Err(message) => ModelStream {
                 events: vec![ModelStreamEvent::Error { message }],
             },
         }
     }
 
-    fn complete(&self, request: ModelRequest) -> Result<(Vec<ModelStreamEvent>, Usage), String> {
+    fn complete(
+        &self,
+        request: ModelRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<(Vec<ModelStreamEvent>, Usage), String> {
         let payload = openrouter_payload(&self.model, request)?;
         let config_path = write_curl_config(&self.api_key)?;
+        let (stdout_path, stdout) = process_capture_file("openrouter", "stdout")?;
+        let (stderr_path, stderr) = match process_capture_file("openrouter", "stderr") {
+            Ok(capture) => capture,
+            Err(error) => {
+                let _ = fs::remove_file(&stdout_path);
+                let _ = fs::remove_file(&config_path);
+                return Err(error);
+            }
+        };
         let output_result = (|| {
             let mut child = Command::new("/usr/bin/curl")
                 .arg("--silent")
@@ -238,8 +338,8 @@ impl OpenRouterProvider {
                 .env_clear()
                 .env("PATH", DEFAULT_SHELL_PATH)
                 .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
+                .stdout(Stdio::from(stdout))
+                .stderr(Stdio::from(stderr))
                 .spawn()
                 .map_err(|error| format!("could not start OpenRouter transport: {error}"))?;
             child
@@ -248,21 +348,39 @@ impl OpenRouterProvider {
                 .ok_or_else(|| "OpenRouter transport did not expose request stdin".to_owned())?
                 .write_all(payload.as_bytes())
                 .map_err(|error| format!("could not write OpenRouter request: {error}"))?;
-            child
-                .wait_with_output()
-                .map_err(|error| format!("OpenRouter transport did not settle: {error}"))
+            // Curl must observe EOF before it begins the request. `wait_with_output`
+            // does this internally, but the cancellation-aware wait below owns the
+            // child lifecycle explicitly.
+            drop(child.stdin.take());
+            let (status, cancelled) =
+                wait_for_child_or_cancellation(&mut child, Some(cancellation))?;
+            if cancelled {
+                return Err("OpenRouter transport cancelled".to_owned());
+            }
+            let stdout = fs::read(&stdout_path)
+                .map_err(|error| format!("cannot read OpenRouter response capture: {error}"))?;
+            let stderr = fs::read(&stderr_path)
+                .map_err(|error| format!("cannot read OpenRouter error capture: {error}"))?;
+            Ok((status, stdout, stderr))
         })();
         // The config carries the Authorization header. It is mode 0600 and is
         // removed before any provider body/error can reach an agent log.
         let _ = fs::remove_file(&config_path);
-        let output = output_result?;
-        if !output.status.success() {
+        let _ = fs::remove_file(&stdout_path);
+        let _ = fs::remove_file(&stderr_path);
+        let (status, stdout, stderr) = output_result?;
+        if cancellation.is_cancelled() {
+            return Err("OpenRouter transport cancelled".to_owned());
+        }
+        // A nonzero curl exit is a transport failure. HTTP status itself is
+        // emitted into stdout by --write-out and parsed below.
+        if !status.success() {
             return Err(format!(
                 "OpenRouter transport failed before a provider response: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                String::from_utf8_lossy(&stderr).trim()
             ));
         }
-        let (body, status) = split_curl_status(&output.stdout)?;
+        let (body, status) = split_curl_status(&stdout)?;
         parse_openrouter_response(body, status)
     }
 }
@@ -293,6 +411,66 @@ fn write_curl_config(api_key: &str) -> Result<PathBuf, String> {
     )
     .map_err(|error| format!("cannot write OpenRouter transport config: {error}"))?;
     Ok(path)
+}
+
+/// Create a private capture file for a child process owned by this host.
+///
+/// Captures avoid the pipe-lifetime trap where a descendant inherited stdout
+/// or stderr after its direct parent exited. The file is unlinked immediately
+/// after the direct child has settled and its snapshot has been read.
+fn process_capture_file(operation: &str, stream: &str) -> Result<(PathBuf, File), String> {
+    for _ in 0..16 {
+        let sequence = PROCESS_CAPTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = env::temp_dir().join(format!(
+            "pi-agent-runebench-{operation}-{}-{sequence}-{stream}",
+            std::process::id(),
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot create private {operation} capture: {error}"
+                ))
+            }
+        }
+    }
+    Err(format!(
+        "cannot allocate a unique private {operation} capture after 16 attempts"
+    ))
+}
+
+/// Poll one direct child and reap it when the run cancellation scope fires.
+/// Detached descendants deliberately keep running: the benchmark policy may
+/// create a background game worker whose lifetime exceeds one agent turn.
+fn wait_for_child_or_cancellation(
+    child: &mut Child,
+    cancellation: Option<&CancellationToken>,
+) -> Result<(ExitStatus, bool), String> {
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("child status could not be read: {error}"))?
+        {
+            return Ok((status, false));
+        }
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            if let Err(error) = child.kill() {
+                if error.kind() != std::io::ErrorKind::InvalidInput {
+                    return Err(format!("cancelled child could not be killed: {error}"));
+                }
+            }
+            let status = child
+                .wait()
+                .map_err(|error| format!("cancelled child could not be reaped: {error}"))?;
+            return Ok((status, true));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 impl ModelProvider for OpenRouterProvider {
@@ -546,170 +724,229 @@ fn number_field(value: &JsonValue, name: &str) -> Result<Option<u64>, String> {
     }
 }
 
+/// The fixed Runebench rs-agent MCP capability made available to Luau tool
+/// handlers. The manifest is checked on every call, not only during policy
+/// construction, so neither an altered handler nor model text can expand the
+/// host's authority.
 #[derive(Clone)]
-struct McpBridge {
-    script: PathBuf,
+struct RunebenchMcpCapability {
+    client: Arc<Mutex<mcp_client::McpClient>>,
+    manifest: CapabilityManifest,
 }
 
-struct BridgeOutput {
-    content: String,
-    is_error: bool,
-    status: Option<i32>,
-}
-
-impl McpBridge {
-    fn docs(&self) -> Result<String, String> {
-        let output = self.invoke(&["docs".to_owned()])?;
-        if output.is_error {
-            return Err(output.content);
-        }
-        Ok(output.content)
-    }
-
-    fn invoke(&self, arguments: &[String]) -> Result<BridgeOutput, String> {
-        let output = Command::new("bun")
-            .arg(&self.script)
-            .args(arguments)
-            .env_clear()
-            .env("PATH", DEFAULT_SHELL_PATH)
-            .env("HOME", "/root")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|error| format!("could not start rs-agent MCP bridge: {error}"))?;
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let content = match (stdout.is_empty(), stderr.is_empty()) {
-            (false, _) => stdout,
-            (true, false) => stderr,
-            (true, true) => "rs-agent MCP bridge returned no output".to_owned(),
-        };
-        Ok(BridgeOutput {
-            content,
-            is_error: !output.status.success(),
-            status: output.status.code(),
-        })
-    }
-}
-
-#[derive(Clone)]
-enum McpOperation {
-    Call,
-    ListResources,
-    ReadResource,
-}
-
-#[derive(Clone)]
-struct McpTool {
-    name: String,
-    description: String,
-    schema: JsonValue,
-    execution_mode: ToolExecutionMode,
-    operation: McpOperation,
-    bridge: Arc<McpBridge>,
-}
-
-impl McpTool {
-    fn from_policy(tool: &PolicyTool, bridge: Arc<McpBridge>) -> Result<Self, String> {
-        if tool.capability != "rs-agent" {
-            return Err(format!(
-                "Runebench policy tool {:?} requested unbound capability {:?}",
-                tool.name, tool.capability
-            ));
-        }
-        let operation = match tool.name.as_str() {
-            "execute_code" | "list_bots" | "disconnect_bot" => McpOperation::Call,
-            "rs_agent_list_resources" => McpOperation::ListResources,
-            "rs_agent_read_resource" => McpOperation::ReadResource,
-            _ => {
-                return Err(format!(
-                    "Runebench policy tool {:?} is not an rs-agent capability",
-                    tool.name
-                ));
-            }
-        };
-        Ok(Self {
-            name: tool.name.clone(),
-            description: tool.description.clone(),
-            schema: tool.schema.clone(),
-            execution_mode: tool.execution_mode,
-            operation,
-            bridge,
-        })
-    }
-
-    fn execute_bridge(&self, arguments: &str) -> Result<BridgeOutput, String> {
-        let command = match self.operation {
-            McpOperation::Call => vec!["call".to_owned(), self.name.clone(), arguments.to_owned()],
-            McpOperation::ListResources => vec!["list-resources".to_owned()],
-            McpOperation::ReadResource => {
-                let value = JsonValue::parse(arguments).map_err(|_| {
-                    "rs_agent_read_resource received invalid JSON arguments".to_owned()
-                })?;
-                let uri = required_string(value.get("uri"), "rs_agent_read_resource uri")?;
-                vec!["read-resource".to_owned(), uri.to_owned()]
-            }
-        };
-        self.bridge.invoke(&command)
-    }
-}
-
-impl AgentTool for McpTool {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn description(&self) -> &str {
-        &self.description
-    }
-
-    fn schema(&self) -> &JsonValue {
-        &self.schema
-    }
-
-    fn execution_mode(&self) -> ToolExecutionMode {
-        self.execution_mode
-    }
-
-    fn execute<'a>(
-        &'a self,
-        call: ToolCall,
-        context: ToolContext,
-        _updates: ToolUpdateSink,
-    ) -> ToolFuture<'a> {
-        let tool = self.clone();
-        let arguments = call.arguments.as_str().to_owned();
-        let call_id = call.id;
-        Box::pin(async move {
-            if context.cancellation.is_cancelled() {
-                return Err(ToolError::Cancelled { tool: tool.name });
-            }
-            let executing_tool = tool.clone();
-            let result = smol::unblock(move || executing_tool.execute_bridge(&arguments)).await;
-            if context.cancellation.is_cancelled() {
-                return Err(ToolError::Cancelled { tool: tool.name });
-            }
-            let result = result.map_err(|message| ToolError::Execution {
-                tool: tool.name.clone(),
-                message,
-            })?;
-            Ok(ToolResult {
-                tool_call_id: call_id,
-                content: result.content,
-                details: Some(SerializedJson::new(format!(
-                    "{{\"mcp_exit_code\":{}}}",
-                    result
-                        .status
-                        .map(|status| status.to_string())
-                        .unwrap_or_else(|| "null".to_owned())
-                ))),
-                usage: None,
-                added_tool_names: Vec::new(),
-                terminate: false,
-                is_error: result.is_error,
+impl RunebenchMcpCapability {
+    fn new(client: Arc<Mutex<mcp_client::McpClient>>) -> Result<Self, String> {
+        let call_tools = ["execute_code", "list_bots", "disconnect_bot"];
+        let mut operations = call_tools
+            .into_iter()
+            .map(|tool| {
+                WorldOperation::mcp("rs-agent", GrantedMcpOperation::Call, Some(tool))
+                    .map(CapabilityOperation::World)
+                    .map_err(|error| error.to_string())
             })
+            .collect::<Result<Vec<_>, _>>()?;
+        operations.extend([
+            WorldOperation::mcp(
+                "rs-agent",
+                GrantedMcpOperation::ListResources,
+                Some("rs_agent_list_resources"),
+            )
+            .map(CapabilityOperation::World)
+            .map_err(|error| error.to_string())?,
+            WorldOperation::mcp(
+                "rs-agent",
+                GrantedMcpOperation::ReadResource,
+                Some("rs_agent_read_resource"),
+            )
+            .map(CapabilityOperation::World)
+            .map_err(|error| error.to_string())?,
+        ]);
+        let grant = CapabilityGrant::new(CapabilityModule::World, operations)
+            .map_err(|error| error.to_string())?;
+        let manifest = CapabilityManifest::new([grant]).map_err(|error| error.to_string())?;
+        Ok(Self { client, manifest })
+    }
+
+    fn operation_for(
+        request: &LuaCapabilityRequest,
+    ) -> Result<CapabilityOperation, LuaCapabilityError> {
+        let operation = match request.method.as_str() {
+            "tools.call" => GrantedMcpOperation::Call,
+            "resources.list" => GrantedMcpOperation::ListResources,
+            "resources.read" => GrantedMcpOperation::ReadResource,
+            method => {
+                return Err(LuaCapabilityError::MethodDenied {
+                    capability: request.capability.clone(),
+                    method: method.to_owned(),
+                });
+            }
+        };
+        WorldOperation::mcp("rs-agent", operation, Some(request.tool_name.as_str()))
+            .map(CapabilityOperation::World)
+            .map_err(|error| LuaCapabilityError::Execution {
+                message: error.to_string(),
+            })
+    }
+
+    fn invoke_blocking(
+        client: &mut mcp_client::McpClient,
+        manifest: &CapabilityManifest,
+        request: LuaCapabilityRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<LuaCapabilityResponse, LuaCapabilityError> {
+        if cancellation.is_cancelled() {
+            return Err(LuaCapabilityError::Cancelled);
+        }
+        let operation = Self::operation_for(&request)?;
+        manifest
+            .check(&pi_agent_luau::capability::CapabilityRequest::new(
+                operation,
+                request.arguments.clone(),
+            ))
+            .map_err(|error| LuaCapabilityError::MethodDenied {
+                capability: request.capability.clone(),
+                method: error.to_string(),
+            })?;
+        let response = match request.method.as_str() {
+            "tools.call" => {
+                if !matches!(request.arguments, JsonValue::Object(_)) {
+                    return Err(LuaCapabilityError::InvalidArguments {
+                        message: "rs-agent tools.call arguments must be a JSON object".to_owned(),
+                    });
+                }
+                let result = client
+                    .tools_call(&request.tool_name, &request.arguments, cancellation)
+                    .map_err(map_mcp_error)?;
+                let details_json = result
+                    .structured_content
+                    .as_ref()
+                    .map(JsonValue::to_json_string)
+                    .transpose()
+                    .map_err(|error| LuaCapabilityError::Execution {
+                        message: format!("cannot encode MCP structured content: {error}"),
+                    })?;
+                JsonValue::object([
+                    (
+                        "content",
+                        JsonValue::String(result.content_text().map_err(map_mcp_error)?),
+                    ),
+                    ("is_error", JsonValue::Bool(result.is_error)),
+                    (
+                        "details_json",
+                        details_json
+                            .map(JsonValue::String)
+                            .unwrap_or(JsonValue::Null),
+                    ),
+                ])
+            }
+            "resources.list" => {
+                let result = client.resources_list(cancellation).map_err(map_mcp_error)?;
+                let resources = result
+                    .resources
+                    .into_iter()
+                    .map(|resource| {
+                        JsonValue::object([
+                            ("uri", JsonValue::String(resource.uri)),
+                            (
+                                "name",
+                                resource
+                                    .name
+                                    .map(JsonValue::String)
+                                    .unwrap_or(JsonValue::Null),
+                            ),
+                            (
+                                "description",
+                                resource
+                                    .description
+                                    .map(JsonValue::String)
+                                    .unwrap_or(JsonValue::Null),
+                            ),
+                            (
+                                "mimeType",
+                                resource
+                                    .mime_type
+                                    .map(JsonValue::String)
+                                    .unwrap_or(JsonValue::Null),
+                            ),
+                        ])
+                    })
+                    .collect::<Vec<_>>();
+                JsonValue::object([
+                    (
+                        "content",
+                        JsonValue::Array(resources)
+                            .to_json_string()
+                            .map(JsonValue::String)
+                            .map_err(|error| LuaCapabilityError::Execution {
+                                message: format!("cannot encode MCP resource list: {error}"),
+                            })?,
+                    ),
+                    ("is_error", JsonValue::Bool(false)),
+                ])
+            }
+            "resources.read" => {
+                let uri = request
+                    .arguments
+                    .get("uri")
+                    .and_then(|value| match value {
+                        JsonValue::String(value) if !value.is_empty() => Some(value.as_str()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| LuaCapabilityError::InvalidArguments {
+                        message: "rs-agent resources.read requires a non-empty uri string"
+                            .to_owned(),
+                    })?;
+                let result = client
+                    .resources_read(uri, cancellation)
+                    .map_err(map_mcp_error)?;
+                JsonValue::object([
+                    (
+                        "content",
+                        JsonValue::String(result.content_text().map_err(map_mcp_error)?),
+                    ),
+                    ("is_error", JsonValue::Bool(false)),
+                ])
+            }
+            _ => unreachable!("operation_for validated the MCP method"),
+        };
+        Ok(LuaCapabilityResponse { value: response })
+    }
+}
+
+impl LuauCapability for RunebenchMcpCapability {
+    fn invoke(
+        &self,
+        request: LuaCapabilityRequest,
+        cancellation: CancellationToken,
+    ) -> LuaCapabilityFuture {
+        let client = Arc::clone(&self.client);
+        let manifest = self.manifest.clone();
+        Box::pin(async move {
+            if cancellation.is_cancelled() {
+                return Err(LuaCapabilityError::Cancelled);
+            }
+            let worker_cancellation = cancellation.clone();
+            let result = smol::unblock(move || {
+                let mut client = client.lock().map_err(|_| LuaCapabilityError::Execution {
+                    message: "rs-agent MCP client lock was poisoned".to_owned(),
+                })?;
+                Self::invoke_blocking(&mut client, &manifest, request, &worker_cancellation)
+            })
+            .await;
+            if cancellation.is_cancelled() {
+                return Err(LuaCapabilityError::Cancelled);
+            }
+            result
         })
+    }
+}
+
+fn map_mcp_error(error: mcp_client::McpError) -> LuaCapabilityError {
+    match error {
+        mcp_client::McpError::Cancelled => LuaCapabilityError::Cancelled,
+        error => LuaCapabilityError::Execution {
+            message: error.to_string(),
+        },
     }
 }
 
@@ -884,6 +1121,38 @@ fn write_audit(path: &PathBuf, docs_loaded: bool) -> Result<(), String> {
     .map_err(|error| format!("cannot write agent-core audit: {error}"))
 }
 
+fn load_mcp_docs(
+    client: &Arc<Mutex<mcp_client::McpClient>>,
+    cancellation: &CancellationToken,
+) -> Result<String, String> {
+    let mut client = client
+        .lock()
+        .map_err(|_| "rs-agent MCP client lock was poisoned".to_owned())?;
+    let resources = client
+        .resources_list(cancellation)
+        .map_err(|error| format!("cannot list rs-agent MCP resources: {error}"))?;
+    let mut parts = Vec::new();
+    for resource in resources.resources {
+        let content = client
+            .resources_read(&resource.uri, cancellation)
+            .and_then(|result| result.content_text())
+            .map_err(|error| {
+                format!(
+                    "cannot read rs-agent MCP resource {:?}: {error}",
+                    resource.uri
+                )
+            })?;
+        if !content.is_empty() {
+            let excerpt = content.chars().take(50_000).collect::<String>();
+            parts.push(format!(
+                "### {}\n{excerpt}",
+                resource.name.unwrap_or(resource.uri)
+            ));
+        }
+    }
+    Ok(parts.join("\n\n"))
+}
+
 fn run(args: Args) -> Result<(), String> {
     let api_key = env::var("OPENROUTER_API_KEY").map_err(|_| {
         "OPENROUTER_API_KEY must be supplied by the caller's secret injector (for example: vault OPENROUTER_API_KEY -- …)".to_owned()
@@ -902,12 +1171,19 @@ fn run(args: Args) -> Result<(), String> {
     let policy_source = fs::read_to_string(&args.policy)
         .map_err(|error| format!("cannot read Luau policy {}: {error}", args.policy.display()))?;
     let policy = Arc::new(LuaPolicy::load(&policy_source).map_err(|error| error.to_string())?);
-    let bridge = Arc::new(McpBridge {
-        script: args.mcp_bridge,
-    });
-    let docs = bridge.docs();
+    let bootstrap_cancellation = CancellationToken::new();
+    let mcp_client = Arc::new(Mutex::new(
+        mcp_client::McpClient::connect_default(&bootstrap_cancellation)
+            .map_err(|error| format!("cannot start rs-agent MCP client: {error}"))?,
+    ));
+    let docs = load_mcp_docs(&mcp_client, &bootstrap_cancellation);
     let docs_loaded = docs.is_ok();
     let docs = docs.unwrap_or_default();
+    let mcp_capability = Arc::new(RunebenchMcpCapability::new(Arc::clone(&mcp_client))?);
+    let mut capability_bindings = CapabilityBindings::new();
+    capability_bindings
+        .insert("rs-agent", mcp_capability)
+        .map_err(|error| format!("cannot bind rs-agent MCP capability: {error}"))?;
 
     let default_tools = DefaultCodingTools::new(&args.workspace)
         .map_err(|error| format!("cannot construct workspace tools: {error}"))?
@@ -925,10 +1201,31 @@ fn run(args: Args) -> Result<(), String> {
                 declaration.name
             ));
         }
-        tools.insert(Arc::new(McpTool::from_policy(
-            declaration,
-            Arc::clone(&bridge),
-        )?));
+        let handler_source = declaration.handler_source.as_deref().ok_or_else(|| {
+            format!(
+                "Runebench policy tool {:?} must declare a coroutine handler_source",
+                declaration.name
+            )
+        })?;
+        tools.insert(Arc::new(
+            LuaToolHandler::new(
+                handler_source,
+                ToolHandlerSpec {
+                    name: declaration.name.clone(),
+                    description: declaration.description.clone(),
+                    schema: declaration.schema.clone(),
+                    capability: declaration.capability.clone(),
+                    execution_mode: declaration.execution_mode,
+                },
+                capability_bindings.clone(),
+            )
+            .map_err(|error| {
+                format!(
+                    "cannot construct Luau handler for Runebench tool {:?}: {error}",
+                    declaration.name
+                )
+            })?,
+        ));
     }
 
     let mut system_prompt =
@@ -965,7 +1262,18 @@ fn run(args: Args) -> Result<(), String> {
     let run = agent
         .start_prompt(args.instruction)
         .map_err(|error| format!("cannot start Runebench agent: {error}"))?;
+    let mut deadline = args.run_deadline.map(|duration| {
+        let agent = agent.clone();
+        DeadlineGuard::arm(duration, move || {
+            eprintln!("[pi-agent-core] Runebench deadline elapsed; requesting cancellation");
+            agent.abort();
+        })
+    });
     let result = smol::block_on(run.drive());
+    let deadline_expired = deadline.as_ref().is_some_and(DeadlineGuard::expired);
+    if let Some(deadline) = &mut deadline {
+        deadline.disarm();
+    }
     let totals = usage.snapshot();
     eprintln!(
         "[pi-agent-core] usage input={} output={} reasoning={}",
@@ -973,7 +1281,14 @@ fn run(args: Args) -> Result<(), String> {
         totals.output_tokens.unwrap_or(0),
         totals.reasoning_tokens.unwrap_or(0)
     );
-    result.map_err(|error| format!("pi-agent-core run failed: {error}"))
+    match result {
+        // Reaching the explicit host deadline is a normal Runebench outcome:
+        // the core emitted its cancellation terminal events and the host exits
+        // cleanly so Harbor can collect the world/verifier result.
+        Err(CoreError::Cancelled) if deadline_expired => Ok(()),
+        Ok(()) => Ok(()),
+        Err(error) => Err(format!("pi-agent-core run failed: {error}")),
+    }
 }
 
 fn main() {
@@ -992,10 +1307,42 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{openrouter_error, parse_openrouter_response, write_curl_config};
-    use pi_agent_core::scheduler::ModelStreamEvent;
+    use super::{
+        mcp_client, openrouter_error, parse_openrouter_response, wait_for_child_or_cancellation,
+        write_curl_config, DeadlineGuard, RunebenchMcpCapability,
+    };
+    use pi_agent_core::scheduler::{CancellationToken, ModelStreamEvent};
+    use pi_agent_core::state::{SerializedJson, ToolCallId};
+    use pi_agent_core::tool::{
+        AgentTool, ToolCall, ToolContext, ToolExecutionMode, ToolUpdateSink,
+    };
+    use pi_agent_luau::tool_handler::{CapabilityBindings, LuaToolHandler, ToolHandlerSpec};
     use pi_agent_protocol::JsonValue;
+    use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    fn mcp_fixture_script(body: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "pi-agent-runebench-luau-mcp-{}-{}.sh",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after epoch")
+                .as_nanos()
+        ));
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("fixture script should be written");
+        let mut permissions = fs::metadata(&path)
+            .expect("fixture script metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).expect("fixture script should be executable");
+        path
+    }
 
     #[test]
     fn parses_openrouter_tool_response_without_serde() {
@@ -1041,5 +1388,115 @@ mod tests {
         assert!(contents.contains("request = \"POST\""));
         assert!(contents.contains("Authorization: Bearer key\\\\\\\"quote"));
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn deadline_invokes_its_expiration_callback_once() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut deadline = DeadlineGuard::arm(Duration::from_millis(5), move || {
+            sender.send(()).expect("test receiver must remain open");
+        });
+
+        receiver
+            .recv_timeout(Duration::from_millis(250))
+            .expect("deadline should invoke its callback");
+        assert!(deadline.expired());
+        deadline.disarm();
+    }
+
+    #[test]
+    fn disarmed_deadline_never_invokes_its_callback() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut deadline = DeadlineGuard::arm(Duration::from_millis(50), move || {
+            sender.send(()).expect("test receiver must remain open");
+        });
+
+        deadline.disarm();
+        assert!(!deadline.expired());
+        assert!(receiver.recv_timeout(Duration::from_millis(75)).is_err());
+    }
+
+    #[test]
+    fn cancellation_reaps_an_inflight_host_child() {
+        let cancellation = CancellationToken::new();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exec sleep 30"])
+            .spawn()
+            .expect("fixture child should start");
+        cancellation.cancel();
+
+        let (status, cancelled) = wait_for_child_or_cancellation(&mut child, Some(&cancellation))
+            .expect("cancelled child should be reaped");
+
+        assert!(cancelled);
+        assert!(!status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn luau_tool_handler_reaches_only_the_bound_rust_mcp_capability() {
+        let script = mcp_fixture_script(
+            r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{}}}' ;;
+    *'"method":"tools/call"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"handler ok"}],"isError":false}}' ;;
+  esac
+done
+"#,
+        );
+        let cancellation = CancellationToken::new();
+        let client = mcp_client::McpClient::connect(
+            mcp_client::McpClientConfig::new(script.clone(), std::iter::empty()),
+            &cancellation,
+        )
+        .expect("fixture MCP client should initialize");
+        let capability = Arc::new(
+            RunebenchMcpCapability::new(Arc::new(Mutex::new(client)))
+                .expect("fixed rs-agent manifest should be valid"),
+        );
+        let mut bindings = CapabilityBindings::new();
+        bindings
+            .insert("rs-agent", capability)
+            .expect("rs-agent capability binding should be unique");
+        let handler = LuaToolHandler::new(
+            r#"
+                return function(call)
+                    local result = coroutine.yield({
+                        kind = "capability",
+                        capability = "rs-agent",
+                        method = "tools.call",
+                        arguments_json = call.arguments_json,
+                    })
+                    return { content = result.content, is_error = result.is_error }
+                end
+            "#,
+            ToolHandlerSpec {
+                name: "execute_code".to_owned(),
+                description: "fixture".to_owned(),
+                schema: JsonValue::object([("type", "object".into())]),
+                capability: "rs-agent".to_owned(),
+                execution_mode: ToolExecutionMode::Sequential,
+            },
+            bindings,
+        )
+        .expect("handler should be valid before it reaches the registry");
+        let result = smol::block_on(handler.execute(
+            ToolCall {
+                id: ToolCallId::new("fixture-call").expect("fixture call id should be valid"),
+                name: "execute_code".to_owned(),
+                arguments: SerializedJson::new(r#"{"bot_name":"agent","code":"noop"}"#),
+            },
+            ToolContext {
+                cancellation,
+                metadata: None,
+            },
+            ToolUpdateSink::disabled(),
+        ))
+        .expect("Luau handler should receive the MCP text result");
+        assert_eq!(result.content, "handler ok");
+        assert!(!result.is_error);
+        drop(handler);
+        let _ = fs::remove_file(script);
     }
 }

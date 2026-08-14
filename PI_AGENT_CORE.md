@@ -11,9 +11,9 @@ OpenRouter key (vault) ──► Rust OpenRouter adapter
                                  │
 Pi default profile ─────────► pi-agent-core-rs ◄── Luau policy
                                  │                      │
-                                 │                 prompts + tool declarations
+                                 │          prompts + declared coroutine handlers
                                  ▼
-                      explicit rs-agent MCP bridge
+                explicit Rust rs-agent MCP capability
                                  │
                                  ▼
                          Runebench game server
@@ -26,8 +26,8 @@ game guidance and declares the five `rs-agent` tools. The Rust host rejects
 any policy capability other than those known bindings.
 
 `OPENROUTER_API_KEY` is passed only to the Rust provider adapter. The default
-shell tools receive an explicit `PATH` but no provider credential, and the Bun
-MCP bridge is launched with a cleared environment.
+shell tools receive an explicit `PATH` but no provider credential. The
+Rust-owned MCP client launches its Bun world server with a cleared environment.
 
 ## Local smoke run
 
@@ -46,6 +46,7 @@ without changing tracked configuration:
 ```bash
 AGENT_CORE_MODEL=openrouter/nvidia/nemotron-3.5-lightning:free make agent-core
 AGENT_CORE_TASK=tasks/mining-xp-5m make agent-core
+AGENT_CORE_RUN_DEADLINE_SEC=390 make agent-core
 AGENT_CORE_AGENT_TIMEOUT_MULTIPLIER=0.22 make agent-core
 ```
 
@@ -72,13 +73,22 @@ Harbor remains responsible for container lifecycle, task timeout, verifier, and
 result artifact collection. Use `make agent-core-direct` only when diagnosing
 Harbor itself.
 
+`AGENT_CORE_RUN_DEADLINE_SEC` defaults to 390 seconds for the five-minute
+Woodcutting task, leaving 30 seconds before Harbor's 420-second agent limit.
+The Rust host requests structured cancellation at that deadline and reaps any
+in-flight provider, MCP, or foreground shell child. It intentionally does not
+kill detached game workers, which may need to continue while the verifier
+collects the world result.
+
 ## Image construction
 
 `make agent-core-image` builds a game base image and then an agent-core image.
 The latter uses BuildKit's named `pi_agent_core` context so the Docker build
 copies only `pi-agent-core-rs` source into a Rust builder stage. That stage
 checks the repository's exact `nightly-2026-07-24` compiler before building;
-the final game image contains only the release binary, policy, and MCP bridge.
+the final game image contains only the release binary and policy. The Bun MCP
+server remains part of the Runebench world image, not an agent TypeScript
+client bridge.
 
 The default cloud image and ordinary `bun generate-tasks.ts` workflow remain
 unchanged. The local agent-core image is selected only through
@@ -87,9 +97,10 @@ unchanged. The local agent-core image is selected only through
 ## Extending the policy
 
 Edit `agents/runebench-policy.luau` to change Runebench-specific prompt text,
-the declared game-tool schemas, or pre-tool allow/block decisions. It cannot
-acquire a new host capability by naming one. Adding a new MCP binding requires
-a corresponding Rust `AgentTool`, a host validation rule, and tests.
+the declared game-tool schemas, pre-tool allow/block decisions, or a declared
+coroutine handler. It cannot acquire a new host capability by naming one.
+Adding a new MCP binding requires a Rust `LuauCapability` implementation,
+a narrowed `CapabilityManifest` grant, policy-handler wiring, and tests.
 
 For the full extension contract, sandbox behavior, limits, and review checklist
-see [`pi-agent-core-rs/LUA.md`](../pi-agent-core-rs/LUA.md).
+see [`pi-agent-core-rs/docs/luau-extensions.md`](../pi-agent-core-rs/docs/luau-extensions.md).

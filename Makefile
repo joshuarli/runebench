@@ -4,6 +4,7 @@ HARBOR_PROJECT ?= $(HOME)/d/harbor
 AGENT_CORE_MODEL ?= openrouter/deepseek/deepseek-v4-flash-0731
 AGENT_CORE_TASK ?= tasks/woodcutting-xp-5m
 AGENT_CORE_JOBS_DIR ?= jobs
+AGENT_CORE_RUN_DEADLINE_SEC ?= 390
 AGENT_CORE_PLATFORM ?= linux/arm64
 AGENT_CORE_BASE_IMAGE ?= runebench-base:local-arm64-agent-core
 AGENT_CORE_IMAGE ?= runebench:local-arm64-agent-core
@@ -46,6 +47,7 @@ agent-core-config:
 	  -e docker \
 	  -a 'pi_agent_core_adapter:RunebenchPiAgentCore' \
 	  -m "$(AGENT_CORE_MODEL)" \
+	  --agent-kwarg "run_deadline_sec=$(AGENT_CORE_RUN_DEADLINE_SEC)" \
 	  -o "$(AGENT_CORE_JOBS_DIR)" \
 	  -n 1 -k 1 | jq .
 
@@ -57,6 +59,7 @@ agent-core: agent-core-image agent-core-generate
 	  AGENT_CORE_TASK="$(AGENT_CORE_TASK)" \
 	  AGENT_CORE_MODEL="$(AGENT_CORE_MODEL)" \
 	  AGENT_CORE_JOBS_DIR="$(AGENT_CORE_JOBS_DIR)" \
+	  AGENT_CORE_RUN_DEADLINE_SEC="$(AGENT_CORE_RUN_DEADLINE_SEC)" \
 	  AGENT_CORE_AGENT_TIMEOUT_MULTIPLIER="$(AGENT_CORE_AGENT_TIMEOUT_MULTIPLIER)" \
 	  AGENT_CORE_VERIFIER_TIMEOUT_MULTIPLIER="$(AGENT_CORE_VERIFIER_TIMEOUT_MULTIPLIER)" \
 	  AGENT_CORE_JOB_NAME="$(AGENT_CORE_JOB_NAME)" \
@@ -74,5 +77,6 @@ agent-core-direct: agent-core-image agent-core-generate
 	  -e docker \
 	  -a 'pi_agent_core_adapter:RunebenchPiAgentCore' \
 	  -m "$(AGENT_CORE_MODEL)" \
+	  --agent-kwarg "run_deadline_sec=$(AGENT_CORE_RUN_DEADLINE_SEC)" \
 	  -o "$(AGENT_CORE_JOBS_DIR)" \
 	  -n 1 -k 1 -y

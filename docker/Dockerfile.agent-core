@@ -89,7 +89,6 @@ RUN bun -e 'require.resolve("@modelcontextprotocol/sdk/server/mcp.js")' \
 
 COPY --from=pi_agent_builder /src/runebench/agents/pi-agent-runebench/target/release/pi-agent-runebench /usr/local/bin/runebench-pi-agent
 COPY agents/runebench-policy.luau /app/benchmark/runebench-policy.luau
-COPY agents/runebench_mcp_bridge.ts /app/benchmark/runebench-mcp-bridge.ts
 RUN chmod 755 /usr/local/bin/runebench-pi-agent && mkdir -p /logs
 
 COPY docker/ensure-services.sh /ensure-services.sh

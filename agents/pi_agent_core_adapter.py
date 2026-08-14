@@ -19,6 +19,23 @@ class RunebenchPiAgentCore(BaseAgent):
     """Runebench's core host with an explicit rs-agent MCP capability binding."""
 
     MODEL_CONNECTION = ModelConnectionSpec(passthrough=True)
+    _DEFAULT_RUN_DEADLINE_SEC = 390
+
+    def __init__(
+        self,
+        run_deadline_sec: int | str = _DEFAULT_RUN_DEADLINE_SEC,
+        *args,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        try:
+            self._run_deadline_sec = int(run_deadline_sec)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "run_deadline_sec must be a positive whole number of seconds"
+            ) from error
+        if self._run_deadline_sec <= 0:
+            raise ValueError("run_deadline_sec must be a positive whole number of seconds")
 
     @staticmethod
     def name() -> str:
@@ -34,8 +51,7 @@ class RunebenchPiAgentCore(BaseAgent):
             )
         result = await environment.exec(
             "test -x /usr/local/bin/runebench-pi-agent "
-            "&& test -f /app/benchmark/runebench-policy.luau "
-            "&& test -f /app/benchmark/runebench-mcp-bridge.ts"
+            "&& test -f /app/benchmark/runebench-policy.luau"
         )
         if result.return_code != 0:
             raise RuntimeError(
@@ -70,10 +86,10 @@ class RunebenchPiAgentCore(BaseAgent):
                 "/app",
                 "--policy",
                 "/app/benchmark/runebench-policy.luau",
-                "--mcp-bridge",
-                "/app/benchmark/runebench-mcp-bridge.ts",
                 "--log-jsonl",
                 "/logs/agent/pi-agent-core.jsonl",
+                "--deadline-seconds",
+                str(self._run_deadline_sec),
                 "2>&1",
                 "|",
                 "tee",
