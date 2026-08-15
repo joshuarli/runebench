@@ -8,7 +8,10 @@ mod mcp_client;
 
 use pi_agent_core::default_tools::CommandEnvironment;
 use pi_agent_core::error::{CoreError, HookError};
-use pi_agent_core::event::{AgentEvent, AgentEventKind, EventObserver, ObserverFuture};
+use pi_agent_core::event::{
+    AgentEvent, AgentEventKind, AutomaticCompactionOutcome, EventObserver, ObserverFuture,
+    ProviderRequestSkipReason,
+};
 use pi_agent_core::hooks::{AfterToolCall, BeforeToolCall, ContextEnvelope, HookSet, NextTurn};
 use pi_agent_core::profile::PiDefaultCodingProfile;
 use pi_agent_core::provider::commandcode::{
@@ -18,10 +21,17 @@ use pi_agent_core::scheduler::{
     CancellationToken, ModelFuture, ModelProvider, ModelRequest, ModelStream, ModelStreamEvent,
 };
 use pi_agent_core::state::{
-    AssistantToolCall, Message, ModelDescriptor, SerializedJson, StopReason, ToolCallId, Usage,
+    AssistantToolCall, Message, MessageId, ModelDescriptor, SerializedJson, StopReason, ToolCallId,
+    Usage,
 };
-use pi_agent_core::tool::{ToolCall, ToolResult};
-use pi_agent_core::{Agent, DefaultCodingTools};
+use pi_agent_core::tool::{
+    FailureSignature, ToolCall, ToolFailure, ToolFailureCircuitBreaker, ToolFailureDisposition,
+    ToolResult,
+};
+use pi_agent_core::{
+    Agent, AutomaticCompactionPolicy, CompactionContext, CompactionError, CompactionFuture,
+    CompactionResult, Compactor, ContextBudgetSource, DefaultCodingTools, OverflowRecovery,
+};
 use pi_agent_luau::capability::{
     CapabilityGrant, CapabilityManifest, CapabilityModule, CapabilityOperation,
     McpOperation as GrantedMcpOperation, WorldOperation,
@@ -37,6 +47,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::num::{NonZeroU32, NonZeroU64};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
@@ -51,7 +62,12 @@ const DEFAULT_SHELL_PATH: &str = "/root/.bun/bin:/usr/local/bin:/usr/bin:/bin";
 const MODEL_TOOL_RESULT_MAX_CHARS: usize = 12_000;
 const MODEL_TOOL_DETAILS_MAX_CHARS: usize = 3_000;
 const BOOTSTRAP_DOC_MAX_CHARS: usize = 24_000;
-const REPEATED_TOOL_FAILURE_LIMIT: usize = 3;
+const RUNEBENCH_CONTEXT_BUDGET_TOKENS: u64 = 32_000;
+const RUNEBENCH_COMPACTION_RESERVE_TOKENS: u64 = 4_096;
+const RUNEBENCH_RECENT_CONTEXT_TOKENS: u64 = 8_000;
+const RUNEBENCH_MAX_AUTOMATIC_COMPACTIONS: u32 = 4;
+const RUNEBENCH_MAX_OVERFLOW_RETRIES: u32 = 1;
+const RUNEBENCH_REPEATED_TOOL_FAILURE_LIMIT: u32 = 3;
 const RS_AGENT_TOOL_NAMES: [&str; 5] = [
     "execute_code",
     "list_bots",
@@ -68,6 +84,7 @@ struct Args {
     policy: PathBuf,
     log_jsonl: PathBuf,
     run_deadline: Option<Duration>,
+    automatic_context_budget: Option<NonZeroU64>,
     commandcode_date: Option<String>,
     commandcode_environment: Option<String>,
     commandcode_thread_id: Option<String>,
@@ -109,6 +126,19 @@ impl Args {
                     })
             })
             .transpose()?;
+        let automatic_context_budget = values
+            .get("--automatic-context-budget-tokens")
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .ok()
+                    .and_then(NonZeroU64::new)
+                    .ok_or_else(|| {
+                        "--automatic-context-budget-tokens must be a positive whole number of tokens"
+                            .to_owned()
+                    })
+            })
+            .transpose()?;
         let commandcode_date = values.get("--commandcode-date").cloned();
         let commandcode_environment = values.get("--commandcode-environment").cloned();
         let commandcode_thread_id = values.get("--commandcode-thread-id").cloned();
@@ -120,6 +150,7 @@ impl Args {
             policy: PathBuf::from(required("--policy")?),
             log_jsonl: PathBuf::from(required("--log-jsonl")?),
             run_deadline,
+            automatic_context_budget,
             commandcode_date,
             commandcode_environment,
             commandcode_thread_id,
@@ -128,7 +159,7 @@ impl Args {
     }
 
     fn usage() -> &'static str {
-        "usage: runebench-pi-agent --model <openrouter/model|commandcode/model> --instruction <text> --workspace <dir> --policy <file.luau> --log-jsonl <file> [--deadline-seconds <positive-seconds>] [--commandcode-date <YYYY-MM-DD> --commandcode-environment <platform> --commandcode-thread-id <UUID> --commandcode-project-slug <slug>]"
+        "usage: runebench-pi-agent --model <openrouter/model|commandcode/model> --instruction <text> --workspace <dir> --policy <file.luau> --log-jsonl <file> [--deadline-seconds <positive-seconds>] [--automatic-context-budget-tokens <positive-tokens>] [--commandcode-date <YYYY-MM-DD> --commandcode-environment <platform> --commandcode-thread-id <UUID> --commandcode-project-slug <slug>]"
     }
 }
 
@@ -185,24 +216,88 @@ impl Drop for DeadlineGuard {
     }
 }
 
-/// Provider protocol conversion stays outside the core and the Lua VM.
+/// Runebench's explicit compaction policy is structural retention, not an
+/// implicit second model request. It keeps the task instruction and the
+/// core-selected intact suffix, including any tool results and details. This
+/// keeps compaction cheap and deterministic while leaving semantic summaries
+/// to a future host that deliberately supplies a summary provider.
 #[derive(Debug, Default)]
-struct ToolFailureTracker {
-    signature: Option<String>,
-    consecutive: usize,
-    terminal_reason: Option<String>,
+struct RunebenchCompactor;
+
+impl Compactor for RunebenchCompactor {
+    fn compact<'a>(
+        &'a self,
+        context: CompactionContext,
+        _cancellation: CancellationToken,
+    ) -> CompactionFuture<'a> {
+        Box::pin(std::future::ready(Ok(CompactionResult::new(
+            context.messages,
+        ))))
+    }
+
+    fn compact_automatic<'a>(
+        &'a self,
+        context: CompactionContext,
+        request: pi_agent_core::AutomaticCompactionRequest,
+        cancellation: CancellationToken,
+    ) -> CompactionFuture<'a> {
+        if cancellation.is_cancelled() {
+            return Box::pin(std::future::ready(Err(CompactionError::failed(
+                "Runebench compaction cancelled before retention",
+            ))));
+        }
+
+        let mut retained = Vec::new();
+        if let Some(initial_instruction) = context
+            .messages
+            .iter()
+            .find(|message| matches!(message, Message::User { .. }))
+        {
+            push_unique_message(&mut retained, initial_instruction.clone());
+        }
+        for message in request.split_turn_prefix {
+            push_unique_message(&mut retained, message);
+        }
+        for message in request.retained_messages {
+            push_unique_message(&mut retained, message);
+        }
+
+        Box::pin(std::future::ready(Ok(CompactionResult::new(retained))))
+    }
 }
 
+fn push_unique_message(messages: &mut Vec<Message>, candidate: Message) {
+    let candidate_id = message_id(&candidate);
+    if !messages
+        .iter()
+        .any(|message| message_id(message) == candidate_id)
+    {
+        messages.push(candidate);
+    }
+}
+
+fn message_id(message: &Message) -> MessageId {
+    match message {
+        Message::User { id, .. }
+        | Message::Assistant { id, .. }
+        | Message::ToolResult { id, .. } => *id,
+    }
+}
+
+/// Provider protocol conversion stays outside the core and the Lua VM.
+///
+/// The hook owns Runebench's capability knowledge and translates raw MCP
+/// results into the typed failure contract. Streak state remains in the core,
+/// so one agent can safely be reused for another run without leaking a dead
+/// capability's count across runs.
 #[derive(Debug, Default)]
 struct OpenAiContextHook {
-    failures: Mutex<ToolFailureTracker>,
     include_error_metadata: bool,
 }
 
 impl OpenAiContextHook {
     fn for_provider(provider: ProviderKind) -> Self {
         Self {
-            failures: Mutex::new(ToolFailureTracker::default()),
             include_error_metadata: provider == ProviderKind::CommandCode,
         }
     }
@@ -210,15 +305,6 @@ impl OpenAiContextHook {
 
 impl HookSet for OpenAiContextHook {
     fn before_tool_call(&self, _call: &ToolCall) -> Result<BeforeToolCall, HookError> {
-        let failures = self
-            .failures
-            .lock()
-            .map_err(|_| HookError::new("before_tool_call", "tool failure tracker was poisoned"))?;
-        if let Some(reason) = &failures.terminal_reason {
-            return Ok(BeforeToolCall::Terminate {
-                reason: reason.clone(),
-            });
-        }
         Ok(BeforeToolCall::Allow)
     }
 
@@ -227,44 +313,19 @@ impl HookSet for OpenAiContextHook {
         call: &ToolCall,
         result: &ToolResult,
     ) -> Result<AfterToolCall, HookError> {
-        let mut failures = self
-            .failures
-            .lock()
-            .map_err(|_| HookError::new("after_tool_call", "tool failure tracker was poisoned"))?;
-        if !result.is_error {
-            failures.signature = None;
-            failures.consecutive = 0;
+        if !result.is_error || result.failure.is_some() {
+            // The scheduler already classified cancellation and structured
+            // tool errors. Never replace a cancellation with a retryable
+            // transport label merely because its text says "aborted".
             return Ok(AfterToolCall::default());
         }
 
-        let signature = format!("{}:{}", call.name, tool_failure_signature(&result.content));
-        if failures.signature.as_deref() == Some(signature.as_str()) {
-            failures.consecutive = failures.consecutive.saturating_add(1);
-        } else {
-            failures.signature = Some(signature);
-            failures.consecutive = 1;
-        }
-        let terminate = tool_error_is_fatal(&result.content)
-            || failures.consecutive >= REPEATED_TOOL_FAILURE_LIMIT;
-        if terminate {
-            failures.terminal_reason = Some(if tool_error_is_fatal(&result.content) {
-                format!(
-                    "terminal rs-agent capability failure: {}",
-                    truncate_for_model(&result.content, 1_000)
-                )
-            } else {
-                format!(
-                    "repeated rs-agent tool failure after {} attempts: {}",
-                    failures.consecutive,
-                    truncate_for_model(&result.content, 1_000)
-                )
-            });
-            return Ok(AfterToolCall {
-                terminate: Some(true),
-                ..AfterToolCall::default()
-            });
-        }
-        Ok(AfterToolCall::default())
+        Ok(AfterToolCall {
+            failure: pi_agent_core::hooks::Replacement::Replace(Some(classify_tool_failure(
+                call, result,
+            ))),
+            ..AfterToolCall::default()
+        })
     }
 
     fn transform_context(&self, context: ContextEnvelope) -> Result<ContextEnvelope, HookError> {
@@ -280,19 +341,64 @@ impl HookSet for OpenAiContextHook {
         Ok(format!("[{}]", messages.join(",")))
     }
 
-    fn should_stop_after_turn(&self, _context: &ContextEnvelope) -> Result<bool, HookError> {
-        let failures = self.failures.lock().map_err(|_| {
-            HookError::new(
-                "should_stop_after_turn",
-                "tool failure tracker was poisoned",
-            )
-        })?;
-        Ok(failures.terminal_reason.is_some())
-    }
-
     fn prepare_next_turn(&self, _context: ContextEnvelope) -> Result<NextTurn, HookError> {
         Ok(NextTurn::default())
     }
+}
+
+fn classify_tool_failure(call: &ToolCall, result: &ToolResult) -> ToolFailure {
+    let normalized = result.content.to_ascii_lowercase();
+    if tool_error_is_fatal(&normalized) {
+        return ToolFailure::fatal(failure_signature(call, result)).with_recovery_guidance(
+            "The rs-agent capability is unavailable; do not retry this tool.",
+        );
+    }
+    if tool_error_is_invalid_arguments(&normalized) {
+        return ToolFailure::invalid_arguments()
+            .with_recovery_guidance("Correct the arguments using the declared tool schema.");
+    }
+    if tool_error_is_retryable(&normalized) {
+        return ToolFailure::retryable(failure_signature(call, result)).with_recovery_guidance(
+            "The rs-agent capability may recover; retry once or choose a different action. Repeated identical failures end this run.",
+        );
+    }
+    ToolFailure::recoverable()
+}
+
+fn failure_signature(call: &ToolCall, result: &ToolResult) -> FailureSignature {
+    FailureSignature::new(format!(
+        "rs-agent:{}:{}",
+        call.name,
+        tool_failure_signature(&result.content)
+    ))
+    .expect("host failure signatures are non-empty")
+}
+
+fn tool_error_is_invalid_arguments(normalized: &str) -> bool {
+    [
+        "invalid argument",
+        "invalid arguments",
+        "argument validation",
+        "schema validation",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+fn tool_error_is_retryable(normalized: &str) -> bool {
+    [
+        "broken pipe",
+        "mcp protocol error",
+        "mcp child exited",
+        "not connected",
+        "waitforconnection timed out",
+        "game state not ready within timeout",
+        "connection refused",
+        "connection reset",
+        "timed out",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
 }
 
 fn openai_message(message: &Message, include_error_metadata: bool) -> Result<String, HookError> {
@@ -1321,12 +1427,126 @@ fn event_json(event: &AgentEvent) -> String {
         AgentEventKind::CompactionStart { .. }
         | AgentEventKind::CompactionResult { .. }
         | AgentEventKind::CompactionEnd { .. } => "{\"type\":\"compaction\"}".to_owned(),
+        AgentEventKind::AutomaticCompactionStart {
+            reason,
+            source_message_count,
+            estimated_tokens_before,
+            retry_provider_request,
+            count,
+        } => format!(
+            "{{\"type\":\"automatic_compaction_start\",\"reason\":{},\"sourceMessageCount\":{},\"estimatedTokensBefore\":{},\"retryProviderRequest\":{},\"count\":{}}}",
+            json_string(automatic_compaction_reason_name(*reason)),
+            source_message_count,
+            optional_u64_json(*estimated_tokens_before),
+            retry_provider_request,
+            count,
+        ),
+        AgentEventKind::AutomaticCompactionEnd {
+            reason,
+            retry_provider_request,
+            outcome,
+        } => format!(
+            "{{\"type\":\"automatic_compaction_end\",\"reason\":{},\"retryProviderRequest\":{},\"outcome\":{}}}",
+            json_string(automatic_compaction_reason_name(*reason)),
+            retry_provider_request,
+            automatic_compaction_outcome_json(outcome),
+        ),
+        AgentEventKind::ContextEstimate {
+            estimated_context_tokens,
+            input_bytes,
+            message_count,
+            message_bytes,
+            tool_result_bytes,
+        } => format!(
+            "{{\"type\":\"context_estimate\",\"estimatedContextTokens\":{},\"inputBytes\":{},\"messageCount\":{},\"messageBytes\":{},\"toolResultBytes\":{}}}",
+            optional_u64_json(*estimated_context_tokens),
+            input_bytes,
+            message_count,
+            message_bytes,
+            tool_result_bytes,
+        ),
+        AgentEventKind::ProviderRequestSkipped { reason } => format!(
+            "{{\"type\":\"provider_request_skipped\",\"reason\":{}}}",
+            json_string(provider_request_skip_reason_name(*reason)),
+        ),
         AgentEventKind::ModelTurnUsage { .. } => "{\"type\":\"model_turn_usage\"}".to_owned(),
         AgentEventKind::MessageUpdate { .. } => "{\"type\":\"message_update\"}".to_owned(),
         AgentEventKind::ToolExecutionUpdate { tool_name, .. } => format!(
             "{{\"type\":\"tool_execution_update\",\"toolName\":{}}}",
             json_string(tool_name)
         ),
+        AgentEventKind::ToolFailureObserved {
+            tool_call_id,
+            disposition,
+            signature,
+            consecutive_count,
+            terminal,
+            message,
+        } => format!(
+            "{{\"type\":\"tool_failure_observed\",\"toolCallId\":{},\"disposition\":{},\"signature\":{},\"consecutiveCount\":{},\"terminal\":{},\"message\":{}}}",
+            json_string(tool_call_id.as_str()),
+            json_string(tool_failure_disposition_name(*disposition)),
+            signature
+                .as_deref()
+                .map(json_string)
+                .unwrap_or_else(|| "null".to_owned()),
+            consecutive_count,
+            terminal,
+            json_string(message),
+        ),
+    }
+}
+
+fn optional_u64_json(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_owned())
+}
+
+fn automatic_compaction_reason_name(
+    reason: pi_agent_core::AutomaticCompactionReason,
+) -> &'static str {
+    match reason {
+        pi_agent_core::AutomaticCompactionReason::Threshold => "threshold",
+        pi_agent_core::AutomaticCompactionReason::Overflow => "overflow",
+    }
+}
+
+fn automatic_compaction_outcome_json(outcome: &AutomaticCompactionOutcome) -> String {
+    match outcome {
+        AutomaticCompactionOutcome::Succeeded {
+            estimated_tokens_after,
+        } => format!(
+            "{{\"status\":\"succeeded\",\"estimatedTokensAfter\":{}}}",
+            optional_u64_json(*estimated_tokens_after)
+        ),
+        AutomaticCompactionOutcome::Failed { message } => format!(
+            "{{\"status\":\"failed\",\"message\":{}}}",
+            json_string(message)
+        ),
+        AutomaticCompactionOutcome::Cancelled => "{\"status\":\"cancelled\"}".to_owned(),
+        AutomaticCompactionOutcome::LimitReached => "{\"status\":\"limit_reached\"}".to_owned(),
+        AutomaticCompactionOutcome::StillAboveThreshold => {
+            "{\"status\":\"still_above_threshold\"}".to_owned()
+        }
+        AutomaticCompactionOutcome::Unavailable => "{\"status\":\"unavailable\"}".to_owned(),
+    }
+}
+
+fn provider_request_skip_reason_name(reason: ProviderRequestSkipReason) -> &'static str {
+    match reason {
+        ProviderRequestSkipReason::AutomaticCompaction => "automatic_compaction",
+        ProviderRequestSkipReason::ToolCircuitBreaker => "tool_circuit_breaker",
+    }
+}
+
+fn tool_failure_disposition_name(disposition: ToolFailureDisposition) -> &'static str {
+    match disposition {
+        ToolFailureDisposition::Cancelled => "cancelled",
+        ToolFailureDisposition::InvalidArguments => "invalid_arguments",
+        ToolFailureDisposition::Recoverable => "recoverable",
+        ToolFailureDisposition::Retryable => "retryable",
+        ToolFailureDisposition::Fatal => "fatal",
     }
 }
 
@@ -1581,6 +1801,20 @@ fn run(args: Args) -> Result<(), String> {
     let host_hooks: Arc<dyn HookSet> = Arc::new(OpenAiContextHook::for_provider(provider_kind));
     let hooks: Arc<dyn HookSet> = Arc::new(LuaPolicyHookSet::new(policy, host_hooks));
     let observer: Arc<dyn EventObserver> = Arc::new(JsonlObserver::create(&args.log_jsonl)?);
+    let automatic_compaction = AutomaticCompactionPolicy {
+        enabled: true,
+        context_budget: ContextBudgetSource::ContextBudget(
+            args.automatic_context_budget.unwrap_or(
+                NonZeroU64::new(RUNEBENCH_CONTEXT_BUDGET_TOKENS)
+                    .expect("Runebench context budget is non-zero"),
+            ),
+        ),
+        reserved_tokens: RUNEBENCH_COMPACTION_RESERVE_TOKENS,
+        recent_tokens: RUNEBENCH_RECENT_CONTEXT_TOKENS,
+        overflow_recovery: OverflowRecovery::CompactAndRetry,
+        max_compactions_per_run: RUNEBENCH_MAX_AUTOMATIC_COMPACTIONS,
+        max_overflow_retries_per_run: RUNEBENCH_MAX_OVERFLOW_RETRIES,
+    };
     let agent = Agent::builder()
         .model(ModelDescriptor {
             provider: provider_kind.descriptor_name().to_owned(),
@@ -1591,7 +1825,15 @@ fn run(args: Args) -> Result<(), String> {
         .tools(tools)
         .hooks(hooks)
         .model_provider(provider)
+        .compactor(Arc::new(RunebenchCompactor))
+        .tool_failure_circuit_breaker(ToolFailureCircuitBreaker {
+            max_consecutive_retryable_failures: NonZeroU32::new(
+                RUNEBENCH_REPEATED_TOOL_FAILURE_LIMIT,
+            ),
+        })
         .observer(observer)
+        .automatic_compaction(automatic_compaction)
+        .map_err(|error| format!("invalid Runebench automatic compaction policy: {error}"))?
         .build();
     let run = agent
         .start_prompt(args.instruction)
@@ -1649,14 +1891,19 @@ mod tests {
     use super::{
         commandcode_request_context, curate_tool_result, mcp_client, openrouter_error, parse_model,
         parse_openrouter_response, wait_for_child_or_cancellation, write_curl_config, Args,
-        DeadlineGuard, OpenAiContextHook, ProviderKind, RunebenchMcpCapability,
+        DeadlineGuard, OpenAiContextHook, ProviderKind, RunebenchCompactor, RunebenchMcpCapability,
+    };
+    use pi_agent_core::compaction::{
+        AutomaticCompactionReason, AutomaticCompactionRequest, CompactionContext,
     };
     use pi_agent_core::hooks::HookSet;
     use pi_agent_core::scheduler::{CancellationToken, ModelStreamEvent};
-    use pi_agent_core::state::{SerializedJson, ToolCallId};
+    use pi_agent_core::state::{AgentMessage, MessageId, SerializedJson, StopReason, ToolCallId};
     use pi_agent_core::tool::{
-        AgentTool, ToolCall, ToolContext, ToolExecutionMode, ToolResult, ToolUpdateSink,
+        AgentTool, ToolCall, ToolContext, ToolExecutionMode, ToolFailureDisposition, ToolResult,
+        ToolUpdateSink,
     };
+    use pi_agent_core::{CompactionResult, Compactor};
     use pi_agent_luau::tool_handler::{CapabilityBindings, LuaToolHandler, ToolHandlerSpec};
     use pi_agent_luau::LuaPolicy;
     use pi_agent_protocol::JsonValue;
@@ -1682,6 +1929,7 @@ mod tests {
             policy: PathBuf::from("/policy.luau"),
             log_jsonl: PathBuf::from("/logs/agent.jsonl"),
             run_deadline: None,
+            automatic_context_budget: None,
             commandcode_date: Some("2026-08-14".into()),
             commandcode_environment: Some("linux".into()),
             commandcode_thread_id: Some("b51a3243-2dd9-4c81-b659-a039645b7d4e".into()),
@@ -1790,7 +2038,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_tool_failures_trip_the_host_circuit_breaker() {
+    fn host_classifies_retryable_tool_failures_for_the_core_circuit_breaker() {
         let hook = OpenAiContextHook::default();
         let call = ToolCall {
             id: ToolCallId::new("failure-call").expect("test call ID should be valid"),
@@ -1805,29 +2053,74 @@ mod tests {
             added_tool_names: Vec::new(),
             terminate: false,
             is_error: true,
+            failure: None,
         };
 
+        let after = hook
+            .after_tool_call(&call, &result)
+            .expect("failure should be classified");
+        let failure = match after.failure {
+            pi_agent_core::hooks::Replacement::Replace(Some(failure)) => failure,
+            _ => panic!("host should provide a typed failure classification"),
+        };
+        assert_eq!(failure.disposition(), ToolFailureDisposition::Retryable);
         assert_eq!(
-            hook.after_tool_call(&call, &result)
-                .expect("first failure should be handled")
-                .terminate,
-            None
+            failure
+                .signature()
+                .expect("retryable failure has a signature")
+                .as_str(),
+            "rs-agent:execute_code:game state not ready within timeout"
         );
-        assert_eq!(
-            hook.after_tool_call(&call, &result)
-                .expect("second failure should be handled")
-                .terminate,
-            None
-        );
-        assert_eq!(
-            hook.after_tool_call(&call, &result)
-                .expect("third failure should terminate")
-                .terminate,
-            Some(true)
-        );
+        assert_eq!(after.terminate, None);
         assert!(matches!(
             hook.before_tool_call(&call),
-            Ok(pi_agent_core::hooks::BeforeToolCall::Terminate { .. })
+            Ok(pi_agent_core::hooks::BeforeToolCall::Allow)
+        ));
+    }
+
+    #[test]
+    fn host_compactor_keeps_instruction_and_core_selected_recent_messages() {
+        let compactor = RunebenchCompactor;
+        let context = CompactionContext {
+            version: 1,
+            system_prompt: String::new(),
+            model: None,
+            messages: vec![
+                AgentMessage::User {
+                    id: MessageId(1),
+                    content: "task instruction".into(),
+                },
+                AgentMessage::Assistant {
+                    id: MessageId(2),
+                    content: "recent response".into(),
+                    tool_calls: Vec::new(),
+                    stop_reason: Some(StopReason::Stop),
+                    error_message: None,
+                },
+            ],
+            host_messages: Vec::new(),
+        };
+        let request = AutomaticCompactionRequest {
+            reason: AutomaticCompactionReason::Threshold,
+            estimated_tokens_before: Some(40_000),
+            context_budget_tokens: 32_000,
+            reserved_tokens: 4_096,
+            recent_tokens: 8_000,
+            prefix_messages: vec![context.messages[0].clone()],
+            retained_messages: vec![context.messages[1].clone()],
+            split_turn_prefix: Vec::new(),
+            retry_provider_request: false,
+        };
+        let replacement =
+            smol::block_on(compactor.compact_automatic(context, request, CancellationToken::new()))
+                .expect("structural compaction should succeed");
+        assert!(matches!(
+            replacement,
+            CompactionResult { messages, .. }
+                if matches!(messages.as_slice(), [
+                    AgentMessage::User { .. },
+                    AgentMessage::Assistant { .. },
+                ])
         ));
     }
 

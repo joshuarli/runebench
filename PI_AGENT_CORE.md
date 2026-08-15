@@ -72,10 +72,23 @@ AGENT_CORE_COMMANDCODE_ENV_FILE=../pi-agent-core-rs/.env \
   make agent-core-commandcode
 ```
 
-The default model is `commandcode/poolside/laguna-s-2.1-free`. The Harbor
-adapter creates one UUID per trial and supplies explicit `linux`, date, and
-`runebench` project metadata to the Command Code provider; these values are
-not discovered by `pi-agent-core-rs` itself.
+The default model is `commandcode/poolside/laguna-s-2.1-free`. A paid smoke can
+select the Qwen model explicitly:
+
+```bash
+AGENT_CORE_COMMANDCODE_MODEL=commandcode/Qwen/Qwen3.7-Flash \
+AGENT_CORE_COMMANDCODE_ENV_FILE=../pi-agent-core-rs/.env \
+make agent-core-commandcode
+```
+
+The Harbor adapter creates one UUID per trial and supplies explicit `linux`,
+date, and `runebench` project metadata to the Command Code provider; these
+values are not discovered by `pi-agent-core-rs` itself.
+
+For a bounded lifecycle smoke that must cross automatic compaction quickly,
+set `AGENT_CORE_CONTEXT_BUDGET_TOKENS` to a positive value. This is a
+caller-owned evaluation override; the normal host default remains 32,000
+tokens and the override does not change the production policy.
 
 ## Artifacts and diagnosis
 
@@ -146,9 +159,34 @@ fixed agent bot name and translates timeout_minutes to the MCP server's timeout
 field. This keeps the model-facing schema narrow without weakening the MCP
 contract.
 
-The provider context projection bounds tool results, preserves structured
-details, marks errors, and records a terminal capability hint for fatal MCP
-failures. The Runebench host also stops after a fatal transport/process error
-or three consecutive failures with the same tool/error signature. These are
-adapter safeguards; the generic kernel remains responsible for the underlying
-typed lifecycle and cancellation contracts.
+The provider context projection bounds tool results with deterministic
+prefix/suffix truncation, preserves structured details when the provider can
+carry them, and otherwise encodes a bounded marked representation in the tool
+text. Error status, the host's stable failure disposition, and recovery
+guidance are model-visible without putting the raw canonical result in the
+provider context.
+
+The host opts into the core's automatic compaction policy with a 32,000-token
+context budget, 4,096 reserved tokens for the compaction request/output, an
+8,000-token recent-message retention target, at most four automatic
+compactions per run, and one overflow recovery retry. The host-owned
+`RunebenchCompactor` performs deterministic structural retention: it keeps the
+task instruction and the core-selected intact recent suffix, including paired
+tool calls/results and tool details. It does not invent a summary provider or
+make a hidden paid model request. Compaction lifecycle events and context
+estimates are written to the structured agent event log; a provider request
+skipped for compaction is observable there as well. Manual compaction remains a
+separate caller-controlled operation.
+
+Tool failures are classified by the host into invalid arguments, ordinary
+recoverable failures, retryable transport/readiness failures, or fatal
+capability/process/transport failures. The core owns the per-run breaker: a
+fatal result terminates the run after recording it, while three consecutive
+retryable failures with the same host-supplied signature terminate the run.
+Success or a changed signature resets the streak, and cancellation remains a
+distinct non-fatal outcome. A terminal result also prevents a subsequent
+provider request, including when other calls remain in a sequential batch.
+
+These are adapter safeguards; the generic kernel remains responsible for the
+underlying typed lifecycle, transcript, projection, and cancellation
+contracts.

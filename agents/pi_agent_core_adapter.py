@@ -7,6 +7,7 @@ task instruction and Harbor-resolved provider credential into that host.
 
 from __future__ import annotations
 
+import os
 import shlex
 from datetime import date
 from uuid import uuid4
@@ -130,6 +131,20 @@ class RunebenchPiAgentCore(BaseAgent):
                     "--commandcode-project-slug",
                     "runebench",
                 ]
+            )
+        # Keep the production policy's 32k default in the Rust host, but allow a caller-owned
+        # evaluation override to force a short smoke across the automatic-compaction boundary.
+        context_budget = os.environ.get("AGENT_CORE_CONTEXT_BUDGET_TOKENS")
+        if context_budget is not None:
+            try:
+                if int(context_budget) <= 0:
+                    raise ValueError
+            except ValueError as error:
+                raise ValueError(
+                    "AGENT_CORE_CONTEXT_BUDGET_TOKENS must be a positive whole number"
+                ) from error
+            command_parts.extend(
+                ["--automatic-context-budget-tokens", shlex.quote(context_budget)]
             )
         command = "set -o pipefail; " + " ".join(
             [*command_parts, "2>&1", "|", "tee", "/logs/agent/pi-agent-core.txt"]
