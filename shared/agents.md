@@ -25,12 +25,12 @@ Code runs in an async context with `bot` (BotActions) and `sdk` (BotSDK) availab
 ```typescript
 // Just execute - auto-connects on first use
 execute_code({
-  bot_name: "agent",
   code: `
     const state = sdk.getState();
     console.log('Position:', state.player.worldX, state.player.worldZ);
 
     // Chop trees for 1 minute
+    const endTime = Date.now() + 60_000;
     while (Date.now() < endTime) {
       const tree = sdk.findNearbyLoc(/^tree$/i);
       if (tree) await bot.chopTree(tree);
@@ -40,6 +40,8 @@ execute_code({
   `
 })
 ```
+
+The host supplies the fixed bot name automatically. Standalone Bun scripts do not receive the injected `bot` and `sdk` globals; keep bot-control loops inside `execute_code`.
 
 ### 3. Observe and Iterate
 

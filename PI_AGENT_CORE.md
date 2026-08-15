@@ -133,3 +133,22 @@ a narrowed `CapabilityManifest` grant, policy-handler wiring, and tests.
 
 For the full extension contract, sandbox behavior, limits, and review checklist
 see [`pi-agent-core-rs/docs/luau-extensions.md`](../pi-agent-core-rs/docs/luau-extensions.md).
+
+## Model-facing Runebench safeguards
+
+The Rust host bootstraps the MCP API resources into the system prompt before
+the model run. The policy therefore exposes only execute_code, list_bots, and
+disconnect_bot; resource listing/reading is a host bootstrap operation, not a
+model workflow.
+
+execute_code accepts code and optional timeout_minutes. The host injects the
+fixed agent bot name and translates timeout_minutes to the MCP server's timeout
+field. This keeps the model-facing schema narrow without weakening the MCP
+contract.
+
+The provider context projection bounds tool results, preserves structured
+details, marks errors, and records a terminal capability hint for fatal MCP
+failures. The Runebench host also stops after a fatal transport/process error
+or three consecutive failures with the same tool/error signature. These are
+adapter safeguards; the generic kernel remains responsible for the underlying
+typed lifecycle and cancellation contracts.

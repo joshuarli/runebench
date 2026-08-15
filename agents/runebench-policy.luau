@@ -7,8 +7,6 @@ local granted_tools = {
     list_bots = true,
     read = true,
     disconnect_bot = true,
-    rs_agent_list_resources = true,
-    rs_agent_read_resource = true,
     write = true,
 }
 
@@ -32,34 +30,10 @@ return function(call)
 end
 ]]
 
-local mcp_list_resources_handler = [[
-return function(_)
-    local result = coroutine.yield({
-        kind = "capability",
-        capability = "rs-agent",
-        method = "resources.list",
-        arguments_json = "{}",
-    })
-    return { content = result.content, is_error = result.is_error }
-end
-]]
-
-local mcp_read_resource_handler = [[
-return function(call)
-    local result = coroutine.yield({
-        kind = "capability",
-        capability = "rs-agent",
-        method = "resources.read",
-        arguments_json = call.arguments_json,
-    })
-    return { content = result.content, is_error = result.is_error }
-end
-]]
-
 return {
     system_prompt_append = [[
 ## Runebench game tools
-The rs-agent MCP server is bridged into native tools. Use execute_code with bot_name "agent" to control the game. Read the API documentation with rs_agent_list_resources followed by rs_agent_read_resource before using unfamiliar bot or sdk methods. Keep individual execute_code calls short while iterating; write longer strategies to a .ts file and run them with bash when appropriate.
+The rs-agent MCP server is bridged into native tools. Use execute_code to control the one Runebench bot; the bot name is fixed to "agent" and is added by the host. The complete Bot/SDK API reference is already included below as "Runebench API reference"; do not spend tool calls listing or reading MCP resources. Keep individual execute_code calls short while iterating, and verify state or XP after each meaningful action. Standalone Bun scripts do not receive the injected bot and sdk globals, so keep bot-control loops inside execute_code.
 ]],
 
     tools = {
@@ -69,7 +43,7 @@ The rs-agent MCP server is bridged into native tools. Use execute_code with bot_
             capability = "rs-agent",
             execution_mode = "sequential",
             handler_source = mcp_tool_call_handler,
-            schema_json = [[{"type":"object","properties":{"bot_name":{"type":"string","description":"Bot name; use agent for the Runebench bot."},"code":{"type":"string","description":"TypeScript code. Available globals are bot (BotActions) and sdk (BotSDK)."},"timeout":{"type":"number","description":"Execution timeout in minutes, from 0.1 to 60; default 2.","minimum":0.1,"maximum":60}},"required":["bot_name","code"],"additionalProperties":false}]],
+            schema_json = [[{"type":"object","properties":{"code":{"type":"string","description":"TypeScript code. Available globals are bot (BotActions) and sdk (BotSDK)."},"timeout_minutes":{"type":"number","description":"Optional execution timeout in minutes, from 0.1 to 60. Omit it for the host default; do not use seconds.","minimum":0.1,"maximum":60}},"required":["code"],"additionalProperties":false}]],
         },
         {
             name = "list_bots",
@@ -86,22 +60,6 @@ The rs-agent MCP server is bridged into native tools. Use execute_code with bot_
             execution_mode = "sequential",
             handler_source = mcp_tool_call_handler,
             schema_json = [[{"type":"object","properties":{"name":{"type":"string","description":"Bot name to disconnect."}},"required":["name"],"additionalProperties":false}]],
-        },
-        {
-            name = "rs_agent_list_resources",
-            description = "List the RuneScape Bot/SDK API documentation resources.",
-            capability = "rs-agent",
-            execution_mode = "sequential",
-            handler_source = mcp_list_resources_handler,
-            schema_json = [[{"type":"object","properties":{},"additionalProperties":false}]],
-        },
-        {
-            name = "rs_agent_read_resource",
-            description = "Read a RuneScape Bot/SDK API documentation resource by URI.",
-            capability = "rs-agent",
-            execution_mode = "sequential",
-            handler_source = mcp_read_resource_handler,
-            schema_json = [[{"type":"object","properties":{"uri":{"type":"string","description":"Resource URI returned by list_resources."}},"required":["uri"],"additionalProperties":false}]],
         },
     },
 

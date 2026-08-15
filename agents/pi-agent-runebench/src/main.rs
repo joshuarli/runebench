@@ -48,6 +48,10 @@ use std::time::Duration;
 
 const OPENROUTER_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const DEFAULT_SHELL_PATH: &str = "/root/.bun/bin:/usr/local/bin:/usr/bin:/bin";
+const MODEL_TOOL_RESULT_MAX_CHARS: usize = 12_000;
+const MODEL_TOOL_DETAILS_MAX_CHARS: usize = 3_000;
+const BOOTSTRAP_DOC_MAX_CHARS: usize = 24_000;
+const REPEATED_TOOL_FAILURE_LIMIT: usize = 3;
 const RS_AGENT_TOOL_NAMES: [&str; 5] = [
     "execute_code",
     "list_bots",
@@ -183,18 +187,83 @@ impl Drop for DeadlineGuard {
 
 /// Provider protocol conversion stays outside the core and the Lua VM.
 #[derive(Debug, Default)]
-struct OpenAiContextHook;
+struct ToolFailureTracker {
+    signature: Option<String>,
+    consecutive: usize,
+    terminal_reason: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct OpenAiContextHook {
+    failures: Mutex<ToolFailureTracker>,
+    include_error_metadata: bool,
+}
+
+impl OpenAiContextHook {
+    fn for_provider(provider: ProviderKind) -> Self {
+        Self {
+            failures: Mutex::new(ToolFailureTracker::default()),
+            include_error_metadata: provider == ProviderKind::CommandCode,
+        }
+    }
+}
 
 impl HookSet for OpenAiContextHook {
     fn before_tool_call(&self, _call: &ToolCall) -> Result<BeforeToolCall, HookError> {
+        let failures = self
+            .failures
+            .lock()
+            .map_err(|_| HookError::new("before_tool_call", "tool failure tracker was poisoned"))?;
+        if let Some(reason) = &failures.terminal_reason {
+            return Ok(BeforeToolCall::Terminate {
+                reason: reason.clone(),
+            });
+        }
         Ok(BeforeToolCall::Allow)
     }
 
     fn after_tool_call(
         &self,
-        _call: &ToolCall,
-        _result: &ToolResult,
+        call: &ToolCall,
+        result: &ToolResult,
     ) -> Result<AfterToolCall, HookError> {
+        let mut failures = self
+            .failures
+            .lock()
+            .map_err(|_| HookError::new("after_tool_call", "tool failure tracker was poisoned"))?;
+        if !result.is_error {
+            failures.signature = None;
+            failures.consecutive = 0;
+            return Ok(AfterToolCall::default());
+        }
+
+        let signature = format!("{}:{}", call.name, tool_failure_signature(&result.content));
+        if failures.signature.as_deref() == Some(signature.as_str()) {
+            failures.consecutive = failures.consecutive.saturating_add(1);
+        } else {
+            failures.signature = Some(signature);
+            failures.consecutive = 1;
+        }
+        let terminate = tool_error_is_fatal(&result.content)
+            || failures.consecutive >= REPEATED_TOOL_FAILURE_LIMIT;
+        if terminate {
+            failures.terminal_reason = Some(if tool_error_is_fatal(&result.content) {
+                format!(
+                    "terminal rs-agent capability failure: {}",
+                    truncate_for_model(&result.content, 1_000)
+                )
+            } else {
+                format!(
+                    "repeated rs-agent tool failure after {} attempts: {}",
+                    failures.consecutive,
+                    truncate_for_model(&result.content, 1_000)
+                )
+            });
+            return Ok(AfterToolCall {
+                terminate: Some(true),
+                ..AfterToolCall::default()
+            });
+        }
         Ok(AfterToolCall::default())
     }
 
@@ -206,13 +275,19 @@ impl HookSet for OpenAiContextHook {
         let messages = context
             .messages
             .iter()
-            .map(openai_message)
+            .map(|message| openai_message(message, self.include_error_metadata))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(format!("[{}]", messages.join(",")))
     }
 
     fn should_stop_after_turn(&self, _context: &ContextEnvelope) -> Result<bool, HookError> {
-        Ok(false)
+        let failures = self.failures.lock().map_err(|_| {
+            HookError::new(
+                "should_stop_after_turn",
+                "tool failure tracker was poisoned",
+            )
+        })?;
+        Ok(failures.terminal_reason.is_some())
     }
 
     fn prepare_next_turn(&self, _context: ContextEnvelope) -> Result<NextTurn, HookError> {
@@ -220,7 +295,7 @@ impl HookSet for OpenAiContextHook {
     }
 }
 
-fn openai_message(message: &Message) -> Result<String, HookError> {
+fn openai_message(message: &Message, include_error_metadata: bool) -> Result<String, HookError> {
     match message {
         Message::User { content, .. } => Ok(format!(
             "{{\"role\":\"user\",\"content\":{}}}",
@@ -254,14 +329,115 @@ fn openai_message(message: &Message) -> Result<String, HookError> {
         }
         Message::ToolResult {
             tool_call_id,
+            tool_name,
             content,
+            details,
+            is_error,
             ..
-        } => Ok(format!(
-            "{{\"role\":\"tool\",\"tool_call_id\":{},\"content\":{}}}",
-            json_string(tool_call_id.as_str()),
-            json_string(content),
-        )),
+        } => {
+            let error_metadata = if include_error_metadata {
+                format!(",\"is_error\":{is_error}")
+            } else {
+                String::new()
+            };
+            Ok(format!(
+                "{{\"role\":\"tool\",\"tool_call_id\":{},\"content\":{}{error_metadata}}}",
+                json_string(tool_call_id.as_str()),
+                json_string(&curate_tool_result(
+                    tool_name,
+                    content,
+                    details.as_ref(),
+                    *is_error,
+                )),
+            ))
+        }
     }
+}
+
+fn curate_tool_result(
+    tool_name: &str,
+    content: &str,
+    details: Option<&SerializedJson>,
+    is_error: bool,
+) -> String {
+    let status = if is_error { "error" } else { "ok" };
+    let content_limit = if is_error {
+        MODEL_TOOL_RESULT_MAX_CHARS.saturating_sub(MODEL_TOOL_DETAILS_MAX_CHARS)
+    } else {
+        MODEL_TOOL_RESULT_MAX_CHARS
+    };
+    let mut output = format!("[{tool_name} result: {status}]\n");
+    if content.is_empty() {
+        output.push_str("(empty result)");
+    } else {
+        output.push_str(&truncate_for_model(content, content_limit));
+    }
+    if let Some(details) = details {
+        output.push_str("\n[structured details]\n");
+        output.push_str(&truncate_for_model(
+            details.as_str(),
+            MODEL_TOOL_DETAILS_MAX_CHARS,
+        ));
+    }
+    if is_error && tool_error_is_fatal(content) {
+        output.push_str("\n[terminal capability error: do not retry this tool]");
+    }
+    truncate_for_model(&output, MODEL_TOOL_RESULT_MAX_CHARS)
+}
+
+fn truncate_for_model(value: &str, limit: usize) -> String {
+    let character_count = value.chars().count();
+    if character_count <= limit {
+        return value.to_owned();
+    }
+    if limit < 32 {
+        return value.chars().take(limit).collect();
+    }
+    let marker = format!(
+        "\n...[truncated {} characters]...\n",
+        character_count.saturating_sub(limit)
+    );
+    let available = limit.saturating_sub(marker.chars().count());
+    let head_count = available.saturating_mul(2) / 3;
+    let tail_count = available.saturating_sub(head_count);
+    let head = value.chars().take(head_count).collect::<String>();
+    let tail = value
+        .chars()
+        .skip(character_count.saturating_sub(tail_count))
+        .collect::<String>();
+    format!("{head}{marker}{tail}")
+}
+
+fn tool_failure_signature(content: &str) -> String {
+    let normalized = content.trim().to_ascii_lowercase();
+    for marker in [
+        "broken pipe",
+        "mcp protocol error",
+        "mcp child exited",
+        "not connected",
+        "invalid json",
+        "waitforconnection timed out",
+        "game state not ready within timeout",
+        "operation aborted",
+    ] {
+        if normalized.contains(marker) {
+            return marker.to_owned();
+        }
+    }
+    normalized.chars().take(240).collect()
+}
+
+fn tool_error_is_fatal(content: &str) -> bool {
+    let normalized = content.to_ascii_lowercase();
+    [
+        "broken pipe",
+        "mcp protocol error",
+        "mcp child exited",
+        "not connected (state: disconnected)",
+        "invalid json",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -896,6 +1072,23 @@ impl RunebenchMcpCapability {
             })
     }
 
+    fn normalize_tool_arguments(
+        tool_name: &str,
+        arguments: &JsonValue,
+    ) -> Result<JsonValue, String> {
+        let mut arguments = arguments
+            .as_object()
+            .cloned()
+            .ok_or_else(|| "rs-agent tool arguments must be a JSON object".to_owned())?;
+        if tool_name == "execute_code" {
+            arguments.insert("bot_name".to_owned(), JsonValue::String("agent".to_owned()));
+            if let Some(timeout) = arguments.remove("timeout_minutes") {
+                arguments.insert("timeout".to_owned(), timeout);
+            }
+        }
+        Ok(JsonValue::Object(arguments))
+    }
+
     fn invoke_blocking(
         client: &mut mcp_client::McpClient,
         manifest: &CapabilityManifest,
@@ -922,8 +1115,11 @@ impl RunebenchMcpCapability {
                         message: "rs-agent tools.call arguments must be a JSON object".to_owned(),
                     });
                 }
+                let arguments =
+                    Self::normalize_tool_arguments(&request.tool_name, &request.arguments)
+                        .map_err(|message| LuaCapabilityError::InvalidArguments { message })?;
                 let result = client
-                    .tools_call(&request.tool_name, &request.arguments, cancellation)
+                    .tools_call(&request.tool_name, &arguments, cancellation)
                     .map_err(map_mcp_error)?;
                 let details_json = result
                     .structured_content
@@ -1227,7 +1423,7 @@ fn write_audit(path: &PathBuf, docs_loaded: bool) -> Result<(), String> {
     fs::write(
         audit_path,
         format!(
-            "{{\"policyLoaded\":true,\"docsLoaded\":{docs_loaded},\"mcpServer\":\"rs-agent\",\"tools\":[\"execute_code\",\"list_bots\",\"disconnect_bot\",\"rs_agent_list_resources\",\"rs_agent_read_resource\"]}}\n"
+            "{{\"policyLoaded\":true,\"docsLoaded\":{docs_loaded},\"mcpServer\":\"rs-agent\",\"tools\":[\"execute_code\",\"list_bots\",\"disconnect_bot\"],\"bootstrapResources\":[\"rs_agent_list_resources\",\"rs_agent_read_resource\"]}}\n"
         ),
     )
     .map_err(|error| format!("cannot write agent-core audit: {error}"))
@@ -1255,7 +1451,7 @@ fn load_mcp_docs(
                 )
             })?;
         if !content.is_empty() {
-            let excerpt = content.chars().take(50_000).collect::<String>();
+            let excerpt = truncate_for_model(&content, BOOTSTRAP_DOC_MAX_CHARS);
             parts.push(format!(
                 "### {}\n{excerpt}",
                 resource.name.unwrap_or(resource.uri)
@@ -1382,7 +1578,7 @@ fn run(args: Args) -> Result<(), String> {
             )
         }
     };
-    let host_hooks: Arc<dyn HookSet> = Arc::new(OpenAiContextHook);
+    let host_hooks: Arc<dyn HookSet> = Arc::new(OpenAiContextHook::for_provider(provider_kind));
     let hooks: Arc<dyn HookSet> = Arc::new(LuaPolicyHookSet::new(policy, host_hooks));
     let observer: Arc<dyn EventObserver> = Arc::new(JsonlObserver::create(&args.log_jsonl)?);
     let agent = Agent::builder()
@@ -1451,16 +1647,18 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        commandcode_request_context, mcp_client, openrouter_error, parse_model,
+        commandcode_request_context, curate_tool_result, mcp_client, openrouter_error, parse_model,
         parse_openrouter_response, wait_for_child_or_cancellation, write_curl_config, Args,
-        DeadlineGuard, ProviderKind, RunebenchMcpCapability,
+        DeadlineGuard, OpenAiContextHook, ProviderKind, RunebenchMcpCapability,
     };
+    use pi_agent_core::hooks::HookSet;
     use pi_agent_core::scheduler::{CancellationToken, ModelStreamEvent};
     use pi_agent_core::state::{SerializedJson, ToolCallId};
     use pi_agent_core::tool::{
-        AgentTool, ToolCall, ToolContext, ToolExecutionMode, ToolUpdateSink,
+        AgentTool, ToolCall, ToolContext, ToolExecutionMode, ToolResult, ToolUpdateSink,
     };
     use pi_agent_luau::tool_handler::{CapabilityBindings, LuaToolHandler, ToolHandlerSpec};
+    use pi_agent_luau::LuaPolicy;
     use pi_agent_protocol::JsonValue;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -1543,6 +1741,94 @@ mod tests {
 
         assert!(message.contains("Zero Data Retention"));
         assert!(message.contains("HTTP 404"));
+    }
+
+    #[test]
+    fn execute_code_arguments_use_the_fixed_bot_and_host_timeout_name() {
+        let arguments = JsonValue::parse(r#"{"code":"return sdk.getState()","timeout_minutes":5}"#)
+            .expect("fixture arguments should parse");
+        let normalized =
+            RunebenchMcpCapability::normalize_tool_arguments("execute_code", &arguments)
+                .expect("execute_code arguments should normalize");
+
+        assert_eq!(
+            normalized.get("bot_name").and_then(JsonValue::as_str),
+            Some("agent")
+        );
+        assert_eq!(
+            normalized.get("timeout").and_then(JsonValue::as_f64),
+            Some(5.0)
+        );
+        assert!(normalized.get("timeout_minutes").is_none());
+    }
+
+    #[test]
+    fn runebench_policy_exposes_only_the_compact_model_tool_set() {
+        let policy = LuaPolicy::load(include_str!("../../../agents/runebench-policy.luau"))
+            .expect("Runebench policy should load");
+        let names = policy
+            .tools()
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["execute_code", "list_bots", "disconnect_bot"]);
+        assert!(policy.system_prompt_append().contains("already included"));
+    }
+
+    #[test]
+    fn model_tool_result_projection_includes_details_and_bounds_output() {
+        let content = format!("head {} tail", "x".repeat(20_000));
+        let details = SerializedJson::new(r#"{"retryable":false,"source":"mcp"}"#);
+        let projected = curate_tool_result("execute_code", &content, Some(&details), true);
+
+        assert!(projected.chars().count() <= super::MODEL_TOOL_RESULT_MAX_CHARS);
+        assert!(projected.contains("[execute_code result: error]"));
+        assert!(projected.contains("[structured details]"));
+        assert!(projected.contains("[truncated"));
+        assert!(projected.contains("tail"));
+    }
+
+    #[test]
+    fn repeated_tool_failures_trip_the_host_circuit_breaker() {
+        let hook = OpenAiContextHook::default();
+        let call = ToolCall {
+            id: ToolCallId::new("failure-call").expect("test call ID should be valid"),
+            name: "execute_code".to_owned(),
+            arguments: SerializedJson::new(r#"{"code":"return 1"}"#),
+        };
+        let result = ToolResult {
+            tool_call_id: call.id.clone(),
+            content: "Error: Game state not ready within timeout".to_owned(),
+            details: None,
+            usage: None,
+            added_tool_names: Vec::new(),
+            terminate: false,
+            is_error: true,
+        };
+
+        assert_eq!(
+            hook.after_tool_call(&call, &result)
+                .expect("first failure should be handled")
+                .terminate,
+            None
+        );
+        assert_eq!(
+            hook.after_tool_call(&call, &result)
+                .expect("second failure should be handled")
+                .terminate,
+            None
+        );
+        assert_eq!(
+            hook.after_tool_call(&call, &result)
+                .expect("third failure should terminate")
+                .terminate,
+            Some(true)
+        );
+        assert!(matches!(
+            hook.before_tool_call(&call),
+            Ok(pi_agent_core::hooks::BeforeToolCall::Terminate { .. })
+        ));
     }
 
     #[test]
